@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { Activity, ArrowLeft, BookOpen, ChevronDown, ChevronUp, DollarSign, KeyRound, Loader2, Plug, Plus, RotateCw, Search, Trash2, X } from "lucide-react";
+import { runModeLabel } from "@/lib/client/runModeLabel";
 import { PROVIDER_CATALOG, canonicalProviderId, catalogEntry, providerHue } from "../lib/providers/catalog";
 import type { CatalogApiStyle, ProviderCatalogEntry } from "../lib/providers/catalog";
 
@@ -873,8 +874,7 @@ export function ProvidersPage() {
                             data-testid={`provider-runmode-${entry.id}`}
                             className="rounded-full border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] font-medium text-white/80"
                           >
-                            {testState[entry.id]?.runMode?.label}
-                            {testState[entry.id]?.runMode?.capabilities?.vision ? " · Vision" : ""}
+                            {runModeLabel(testState[entry.id]?.runMode)}
                           </span>
                         )}
                       </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Play, Plug, Plus, Sparkles, Trash2, X, Zap,
@@ -14,6 +14,7 @@ import { ComputersSettings } from './ComputersSettings';
 import { AutopilotIdle } from './AutopilotIdle';
 import { removeRole, moveRole } from '../utils/pipeline';
 import { parseBudgetInput } from '../utils/budget';
+import { runModeLabel } from '../../../lib/client/runModeLabel';
 
 
 type Tab = 'general' | 'providers' | 'agent' | 'computers' | 'appearance' | 'account' | 'memory';
@@ -29,6 +30,28 @@ type Accent = 'cyan' | 'emerald' | 'violet';
  *  had providers configured. */
 export function countConfiguredProviders(localCount: number, serverConfiguredCount: number) {
   return localCount + serverConfiguredCount;
+}
+
+export function RunModeBadge({ runMode }: { runMode?: { mode?: string; label?: string; reason?: string; capabilities?: { vision?: boolean } } | string | null }) {
+  const label = runModeLabel(runMode as Parameters<typeof runModeLabel>[0]);
+  if (!label) return null;
+  const reason = typeof runMode === 'string' ? undefined : runMode?.reason;
+  const tooltip =
+    reason ??
+    (label === 'Vision desktop'
+      ? 'The agent will see the screen through screenshots.'
+      : label === 'Text desktop (no vision)'
+        ? 'No vision: the agent works from OCR and accessibility text.'
+        : label);
+  return (
+    <span
+      title={tooltip}
+      data-testid="provider-runmode"
+      className="inline-flex rounded-full border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] font-medium text-white/80"
+    >
+      {label}
+    </span>
+  );
 }
 
 /* Active-tab / toggle accent per selection — full class literals so Tailwind picks them up. */
@@ -1614,7 +1637,7 @@ function ServerEndpoints({
   });
   const [discovered, setDiscovered] = useState<DiscoveredModel[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; text: string; runMode?: { mode?: string; label?: string; reason?: string; capabilities?: { vision?: boolean } } } | null>(null);
   const [capBusy, setCapBusy] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1749,6 +1772,7 @@ function ServerEndpoints({
       setResult({
         ok: true,
         text: `${String(data.model ?? 'model')} replied in ${Number(data.latencyMs ?? 0)}ms: ${text}`,
+        runMode: data.runMode as { mode?: string; label?: string; reason?: string; capabilities?: { vision?: boolean } } | undefined,
       });
     } catch {
       setResult({ ok: false, text: 'Could not reach the test endpoint.' });
@@ -2047,7 +2071,10 @@ function ServerEndpoints({
           )}
         </div>
         {result && (
-          <div data-testid="endpoint-result" className={`text-[10px] ${result.ok ? 'text-emerald-300/80' : 'text-red-300/80'}`}>{result.text}</div>
+          <div className="space-y-1">
+            <div data-testid="endpoint-result" className={`text-[10px] ${result.ok ? 'text-emerald-300/80' : 'text-red-300/80'}`}>{result.text}</div>
+            {result.ok && <RunModeBadge runMode={result.runMode} />}
+          </div>
         )}
       </div>
     </section>

@@ -30,10 +30,24 @@ export const RECENT_FINISHED_WINDOW_MS = 10 * 60 * 1000;
 /** sessionStorage key for the last run id, used as a reattach hint. */
 export const LAST_RUN_HINT_KEY = "sa.lastRunId";
 
+/**
+ * Server-minted run ids are `run_` + 1-64 alphanumerics, `_` or `-`
+ * (see lib/runtime/durable-queue.ts). Only that shape may be stored in
+ * or trusted from sessionStorage: the hint is read back as a run id and
+ * used to attach the stream, so an arbitrary stored value would be a
+ * storage-poisoning vector (Sonar tssecurity:S8475).
+ */
+export const RUN_HINT_ID_RE = /^run_[A-Za-z0-9_-]{1,64}$/;
+
+export function isValidRunHintId(runId: string): boolean {
+  return RUN_HINT_ID_RE.test(runId);
+}
+
 export function readLastRunHint(): string | undefined {
   try {
     if (typeof sessionStorage === "undefined") return undefined;
-    return sessionStorage.getItem(LAST_RUN_HINT_KEY) ?? undefined;
+    const stored = sessionStorage.getItem(LAST_RUN_HINT_KEY) ?? undefined;
+    return stored !== undefined && isValidRunHintId(stored) ? stored : undefined;
   } catch {
     return undefined;
   }
@@ -42,6 +56,7 @@ export function readLastRunHint(): string | undefined {
 export function writeLastRunHint(runId: string): void {
   try {
     if (typeof sessionStorage === "undefined") return;
+    if (!isValidRunHintId(runId)) return;
     sessionStorage.setItem(LAST_RUN_HINT_KEY, runId);
   } catch {
     // Storage full or blocked: the poll still finds the run.

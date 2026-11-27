@@ -126,9 +126,9 @@ test("last-run hint: round-trips through sessionStorage and tolerates its absenc
       },
     };
     assert.equal(readLastRunHint(), undefined);
-    writeLastRunHint("run-123");
-    assert.equal(readLastRunHint(), "run-123");
-    assert.equal(store.get(LAST_RUN_HINT_KEY), "run-123");
+    writeLastRunHint("run_123");
+    assert.equal(readLastRunHint(), "run_123");
+    assert.equal(store.get(LAST_RUN_HINT_KEY), "run_123");
     clearLastRunHint();
     assert.equal(readLastRunHint(), undefined);
   } finally {
@@ -137,8 +137,38 @@ test("last-run hint: round-trips through sessionStorage and tolerates its absenc
   }
   // Without sessionStorage (plain node) the helpers are no-ops, not throws.
   assert.equal(readLastRunHint(), undefined);
-  writeLastRunHint("run-123");
+  writeLastRunHint("run_123");
   clearLastRunHint();
+});
+
+test("last-run hint: rejects values that are not server-minted run ids", () => {
+  const previous = (globalThis as { sessionStorage?: unknown }).sessionStorage;
+  try {
+    const store = new Map<string, string>();
+    (globalThis as { sessionStorage: unknown }).sessionStorage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        store.set(key, value);
+      },
+      removeItem: (key: string) => {
+        store.delete(key);
+      },
+    };
+    // A poisoned value written straight to storage reads back as absent.
+    store.set(LAST_RUN_HINT_KEY, '"><script>alert(1)</script>');
+    assert.equal(readLastRunHint(), undefined);
+    store.set(LAST_RUN_HINT_KEY, "run_../../etc/passwd");
+    assert.equal(readLastRunHint(), undefined);
+    // And writeLastRunHint refuses to store one in the first place.
+    store.delete(LAST_RUN_HINT_KEY);
+    writeLastRunHint("not-a-run-id");
+    assert.equal(store.has(LAST_RUN_HINT_KEY), false);
+    writeLastRunHint("run_123");
+    assert.equal(readLastRunHint(), "run_123");
+  } finally {
+    if (previous === undefined) delete (globalThis as { sessionStorage?: unknown }).sessionStorage;
+    else (globalThis as { sessionStorage: unknown }).sessionStorage = previous;
+  }
 });
 
 test("loadActiveRun: selects from the fetched runs and returns null on a 503", async () => {

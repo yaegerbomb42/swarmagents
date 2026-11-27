@@ -125,6 +125,32 @@ export async function callProvider(
     };
   }
 
+  if (p.format === 'responses') {
+    // OpenAI Responses wire format (Arena, Perplexity Agent API): POST
+    // /v1/responses with instructions + input; the reply text lives in
+    // output_text, or in the message items' output_text parts.
+    const r = await fetch(`${base}/responses`, {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        ...(p.apiKey ? { authorization: `Bearer ${p.apiKey}` } : {}),
+      },
+      body: JSON.stringify({ model: p.model, instructions: system, input: user }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j?.error?.message || r.statusText);
+    const text =
+      typeof j.output_text === 'string'
+        ? j.output_text
+        : (j.output ?? [])
+            .flatMap((item: { content?: { type?: string; text?: string }[] }) => item.content ?? [])
+            .filter((c: { type?: string }) => c.type === 'output_text')
+            .map((c: { text?: string }) => c.text ?? '')
+            .join('');
+    return { text, inTok: j.usage?.input_tokens, outTok: j.usage?.output_tokens };
+  }
+
   // OpenAI-compatible
   const userContent = images.length
     ? [{ type: 'text', text: user }, ...images.map((i) => ({ type: 'image_url', image_url: { url: i.dataUrl } }))]

@@ -1,4 +1,4 @@
-export type ApiFormat = 'openai' | 'anthropic' | 'gemini' | 'cohere';
+export type ApiFormat = 'openai' | 'anthropic' | 'gemini' | 'cohere' | 'responses';
 export type RotationStrategy = 'ranked_fallback' | 'round_robin' | 'racing' | 'random';
 
 export interface ProviderPreset {
@@ -78,12 +78,59 @@ export const PROVIDERS: ProviderPreset[] = [
   { id: 'anthropic', name: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-5-sonnet-latest', format: 'anthropic', keyHint: 'sk-ant-…', color: '#d97757' },
   { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o', format: 'openai', keyHint: 'sk-…', color: '#10a37f' },
   { id: 'gemini', name: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-1.5-pro', format: 'gemini', keyHint: 'AIza…', color: '#4285f4' },
-  { id: 'xai', name: 'xAI Grok', baseUrl: 'https://api.x.ai/v1', model: 'grok-beta', format: 'openai', keyHint: 'xai-…', color: '#e5e5e5' },
+  { id: 'xai', name: 'xAI Grok', baseUrl: 'https://api.x.ai/v1', model: 'grok-4', format: 'openai', keyHint: 'xai-…', color: '#e5e5e5' },
+  { id: 'meta', name: 'Meta Muse', baseUrl: 'https://api.meta.ai/v1', model: 'muse-spark-1.3', format: 'openai', keyHint: 'MODEL_API_KEY', color: '#0082fb' },
+  { id: 'arena', name: 'Arena', baseUrl: 'https://api.arena.ai/v1', model: 'coding-router-preview', format: 'responses', keyHint: 'ARENA_API_KEY', color: '#f59e0b' },
   { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', format: 'openai', keyHint: 'sk-…', color: '#4d6bfe' },
   { id: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.1-8b-instant', format: 'openai', keyHint: 'gsk_…', color: '#f55036' },
   { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o', format: 'openai', keyHint: 'sk-or-…', color: '#8b5cf6' },
   { id: 'ollama', name: 'Ollama / Local', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1', format: 'openai', keyHint: 'not required', color: '#ffffff', local: true },
   { id: 'custom', name: 'Custom Gateway (LiteLLM / Claude Code proxy)', baseUrl: 'http://localhost:8000/v1', model: 'custom-model', format: 'openai', keyHint: 'optional', color: '#94a3b8' },
+];
+
+/**
+ * Frontier agent harnesses — the external agent stacks the user can point
+ * A1 at, surfaced as one section in Settings (Providers tab). A "harness"
+ * here is the frontier lab's agent stack, not just its model API: each
+ * entry wires up that lab's provider preset in one click (reusing the
+ * normal provider-setup flow) and notes how the harness itself is used.
+ * The provider preset is the thing A1 actually calls; the harness note
+ * tells the user where that same key / endpoint also drives the lab's own
+ * terminal agent (Muse Code, Codex) or that there is nothing extra to
+ * install (Grok, which A1 drives straight through the xAI API).
+ */
+export interface FrontierHarness {
+  id: string;
+  name: string;
+  blurb: string;
+  /** Id of the one-click provider preset in PROVIDERS this harness configures. */
+  presetId: string;
+  /** How the lab's own harness is used (or that there is none to install). */
+  harnessNote: string;
+}
+
+export const FRONTIER_HARNESSES: FrontierHarness[] = [
+  {
+    id: 'grok',
+    name: 'Grok',
+    blurb: 'xAI frontier models via the OpenAI-compatible xAI API.',
+    presetId: 'xai',
+    harnessNote: 'A1 drives Grok straight through the xAI API — no separate harness to install.',
+  },
+  {
+    id: 'muse',
+    name: 'Muse',
+    blurb: 'Meta frontier models via the Meta Model API (OpenAI-compatible).',
+    presetId: 'meta',
+    harnessNote: 'Muse Code is Meta’s terminal coding agent — install `muse`; it signs in with the same Model API key and runs on Muse Spark.',
+  },
+  {
+    id: 'arena',
+    name: 'Arena',
+    blurb: 'Frontier models via the Arena API (OpenAI Responses wire format).',
+    presetId: 'arena',
+    harnessNote: 'Arena doubles as a Codex model provider — the same key and base URL configure Codex.',
+  },
 ];
 
 export const DEFAULT_MCP_SKILLS: McpSkill[] = [

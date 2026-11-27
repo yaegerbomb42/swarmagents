@@ -285,6 +285,42 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     },
   },
   {
+    id: "meta",
+    name: "Meta (Muse)",
+    shortDescription: "Muse models via the Meta Model API (OpenAI-compatible chat completions).",
+    apiStyle: "openai-chat",
+    baseUrl: "https://api.meta.ai/v1",
+    models: {
+      default: "muse-spark-1.3",
+      popular: ["muse-wonder-1.0", "muse-spark-1.3"],
+    },
+    authHeader: "bearer",
+    envVar: "SWARM_KEYS_META",
+    standardEnvVar: "MODEL_API_KEY",
+    links: {
+      console: "https://dev.meta.ai",
+      docs: "https://dev.meta.ai/docs/overview",
+    },
+  },
+  {
+    id: "arena",
+    name: "Arena",
+    shortDescription: "Frontier models via the Arena API (OpenAI Responses wire format; the Codex model provider).",
+    apiStyle: "openai-responses",
+    baseUrl: "https://api.arena.ai/v1",
+    models: {
+      default: "coding-router-preview",
+      popular: ["coding-router-preview", "claude-coding-router-preview"],
+    },
+    authHeader: "bearer",
+    envVar: "SWARM_KEYS_ARENA",
+    standardEnvVar: "ARENA_API_KEY",
+    links: {
+      console: "https://platform.arena.ai",
+      docs: "https://platform.arena.ai/docs/codex",
+    },
+  },
+  {
     id: "openrouter",
     name: "OpenRouter",
     shortDescription: "One key for hundreds of models across many providers.",

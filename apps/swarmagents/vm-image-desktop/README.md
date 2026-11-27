@@ -86,6 +86,7 @@ standard container-safe flags:
 
 ```text
 /usr/bin/chromium --user-data-dir=/workspace/.swarm/browser-profile \
+  --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 \
   --no-first-run --no-default-browser-check \
   --disable-features=TranslateUI --start-maximized
 ```
@@ -94,6 +95,11 @@ The profile lives on the `/workspace` named volume, so logins and cookies
 survive VM hibernation and container recreation. The headed Playwright MCP
 server shares the same profile dir. Clear it from the browser view or via
 `DELETE /api/runtime/vm/browser-profile` (signs the VM browser out everywhere).
+
+The `--remote-debugging-port` flags expose the browser's CDP endpoint on
+loopback only (`http://127.0.0.1:9222`); the agent's Playwright MCP server
+attaches to that endpoint instead of launching a second Chromium, which
+would fail against the shared profile's singleton lock.
 
 The driver creates desktop containers with `--shm-size=1g`, so Chromium's
 shared-memory needs are covered — **no `--no-sandbox`** is used. If you ever
@@ -113,9 +119,12 @@ Claude Code config in desktop mode:
   validation lives in `computer-mcp/validate.mjs`, shared with the harness's
   risk/telemetry layer.
 - `playwright-mcp` — the pinned `@playwright/mcp` (0.0.85, installed
-  globally as `playwright-mcp`), configured to drive the **same** visible
-  Chromium on `DISPLAY=:1` (headed), so the user sees every navigation on
-  the desktop.
+  globally as `playwright-mcp`), attached via `--cdp-endpoint
+  http://127.0.0.1:9222` to the **same** visible Chromium on `DISPLAY=:1`
+  (headed), so the user sees every navigation on the desktop. The launcher
+  waits up to 10s for the CDP endpoint to answer before starting the
+  server, so a cold desktop fails loudly instead of failing the first
+  browser call.
 
 ## Healthcheck
 

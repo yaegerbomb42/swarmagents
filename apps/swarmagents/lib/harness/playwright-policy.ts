@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { CDP_DEBUG_PORT } from "../browser/cdp-endpoint";
 
 /** Network endpoint shared by Playwright MCP processes inside one VM. */
 export const PLAYWRIGHT_PROXY_ORIGIN = "http://127.0.0.1:18793";
@@ -8,35 +7,6 @@ export const PLAYWRIGHT_LAUNCHER_PATH = "/workspace/.swarm/playwright-mcp-launch
 
 /** Path of the Playwright MCP per-page request guard inside the VM. */
 export const PLAYWRIGHT_POLICY_PATH = "/workspace/.swarm/playwright-policy.cjs";
-
-/**
- * Path of the Playwright MCP config file inside the VM. It carries the one
- * browser-launch option the CLI cannot: `--remote-debugging-port=9222`, so
- * the Browser tab can mirror the agent's Chromium over CDP (see
- * lib/browser/cdp-endpoint.ts). The CLI rejects unknown flags outright
- * (verified against @playwright/mcp@0.0.85, the version pinned in the
- * desktop image: `error: unknown option '--remote-debugging-port=9222'`),
- * and it has no --browser-arg flag — but a config file's
- * browser.launchOptions.args is merged into the launch options and honored
- * by the server (validateBrowserConfig keeps `args`, appending only
- * --disable-blink-features=AutomationControlled). The headless entry does
- * NOT use this config: each headless run launches its own ephemeral
- * Chromium, and every one of them would contend for port 9222.
- */
-export const PLAYWRIGHT_MCP_CONFIG_PATH = "/workspace/.swarm/playwright-mcp.config.json";
-
-/** Playwright MCP config: open the CDP debug port on the headed browser. */
-export const PLAYWRIGHT_MCP_CONFIG_SOURCE = JSON.stringify(
-  {
-    browser: {
-      launchOptions: {
-        args: [`--remote-debugging-port=${CDP_DEBUG_PORT}`],
-      },
-    },
-  },
-  null,
-  2,
-);
 
 /**
  * Request guard loaded by Playwright MCP's --init-page hook for every tab.
@@ -406,6 +376,23 @@ function shutdownStale() {
     req.end();
   });
 }
+// True when the desktop Chromium's CDP endpoint answers /json/version.
+// The headed Playwright MCP server attaches to the visible Chromium
+// (--cdp-endpoint), so the launcher waits for that endpoint before
+// spawning it; without the wait a cold desktop would fail the first
+// browser call with an opaque connection error.
+const CDP_WAIT_ATTEMPTS = 100;
+const CDP_WAIT_MS = 100;
+function cdpReady(endpoint) {
+  return new Promise((resolve) => {
+    const req = http.get(endpoint + "/json/version", { timeout: 750 }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode === 200));
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+  });
+}
 function rotateProxyLog() {
   try {
     if (fs.existsSync(proxyLogPath) && fs.statSync(proxyLogPath).size > MAX_PROXY_LOG_BYTES) {
@@ -448,6 +435,23 @@ async function main() {
     "--proxy-server", proxyOrigin,
     "--proxy-bypass", "<-loopback>",
   ]);
+  // CDP mode (--cdp-endpoint): the server attaches to the visible desktop
+  // Chromium, so wait until its endpoint answers before spawning. Failing
+  // here with a clear error beats a server that starts and then fails
+  // every browser call with an opaque connection error. Launch mode (no
+  // --cdp-endpoint, e.g. headless) needs no wait.
+  const cdpIndex = args.indexOf("--cdp-endpoint");
+  if (cdpIndex !== -1 && args[cdpIndex + 1]) {
+    const cdpEndpoint = args[cdpIndex + 1];
+    let cdpUp = false;
+    for (let i = 0; i < CDP_WAIT_ATTEMPTS && !cdpUp; i++) {
+      cdpUp = await cdpReady(cdpEndpoint);
+      if (!cdpUp) await sleep(CDP_WAIT_MS);
+    }
+    if (!cdpUp) {
+      throw new Error("The desktop browser did not expose its CDP endpoint at " + cdpEndpoint + " — is Chromium running on the desktop?");
+    }
+  }
   const child = spawn("playwright-mcp", args, { stdio: "inherit", env: process.env });
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, () => child.kill(signal));

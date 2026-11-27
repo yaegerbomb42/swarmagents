@@ -1073,6 +1073,22 @@ test("emits computer.action events for desktop MCP calls, with redacted summarie
       type: "user",
       message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_d3", content: "ok", is_error: false }] },
     },
+    {
+      type: "assistant",
+      message: {
+        id: "d4",
+        content: [{
+          type: "tool_use",
+          id: "tu_d4",
+          name: "mcp__playwright-mcp__browser_type",
+          input: { text: `type ${PLAIN_SECRET}` },
+        }],
+      },
+    },
+    {
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_d4", content: "done", is_error: false }] },
+    },
   ];
   const lines = [INIT, ...DESKTOP_CALLS, M6, RESULT].map((l) => JSON.stringify(l));
   const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
@@ -1084,7 +1100,7 @@ test("emits computer.action events for desktop MCP calls, with redacted summarie
   assert.equal(outcome.exitCode, 0);
 
   const computer = events.filter((e): e is Extract<TelemetryEvent, { type: "computer.action" }> => e.type === "computer.action");
-  assert.equal(computer.length, 3);
+  assert.equal(computer.length, 4);
   assert.deepEqual(computer[0], { type: "computer.action", action: "Clicking at (44, 66)", x: 44, y: 66 });
   assert.deepEqual(computer[1], {
     type: "computer.action",
@@ -1098,6 +1114,14 @@ test("emits computer.action events for desktop MCP calls, with redacted summarie
     // surfaces. "login as [REDACTED]" is 19 chars.
     action: "Typing (19 chars)",
     text: "login as [REDACTED]",
+  });
+  assert.deepEqual(computer[3], {
+    type: "computer.action",
+    // Same redaction for a Playwright browser_type call: the secret typed
+    // into the visible browser never reaches any event. "type [REDACTED]"
+    // is 15 chars.
+    action: "Typing (15 chars)",
+    text: "type [REDACTED]",
   });
 
   // The tool.call event carries the deep-redacted input; no event leaks the

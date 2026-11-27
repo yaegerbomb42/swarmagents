@@ -102,13 +102,16 @@ function CopyButton({ text, label }: { text: string; label: string }) {
  * guarded by. Self-contained: it knows the run from props and posts to the
  * rewind API, showing its own progress and outcome inline.
  */
-function RewindButton({ runId, stepSeq, label }: {
+export function RewindButton({ runId, stepSeq, label, initialState = "idle" }: {
   readonly runId: string;
   readonly stepSeq: number;
   readonly label: string;
+  /** Test seam for static rendering of each state. */
+  readonly initialState?: "idle" | "confirm" | "rewinding" | "done" | "error";
 }) {
-  const [state, setState] = useState<"idle" | "rewinding" | "done" | "error">("idle");
+  const [state, setState] = useState<"idle" | "confirm" | "rewinding" | "done" | "error">(initialState);
   const [error, setError] = useState<string>();
+  const [undoLabel, setUndoLabel] = useState<string>();
   const rewind = async () => {
     setState("rewinding");
     setError(undefined);
@@ -118,27 +121,49 @@ function RewindButton({ runId, stepSeq, label }: {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ checkpointSeq: stepSeq }),
       });
-      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      const body = (await res.json().catch(() => null)) as { error?: string; undoLabel?: string } | null;
       if (!res.ok) {
         throw new Error(body?.error ?? `Rewind failed (${res.status}).`);
       }
+      setUndoLabel(typeof body?.undoLabel === "string" ? body.undoLabel : undefined);
       setState("done");
     } catch (err) {
       setState("error");
       setError(err instanceof Error ? err.message : "Rewind failed.");
     }
   };
+  const btn =
+    "inline-flex shrink-0 items-center gap-1 rounded-md border border-sa-line bg-sa-panel px-2 py-1 text-[11px] font-medium text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg disabled:cursor-not-allowed disabled:opacity-50";
+  if (state === "confirm") {
+    // Two-step: a rewind replaces the machine, so the first click only asks.
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1" data-testid="trace-rewind-confirm">
+        <span className="text-[11px] text-sa-fg2">Restore VM to {label}? Current state is saved as an undo point.</span>
+        <button type="button" onClick={() => void rewind()} data-testid="trace-rewind-go" className={btn}>
+          Rewind
+        </button>
+        <button type="button" onClick={() => setState("idle")} data-testid="trace-rewind-cancel" className={btn}>
+          Cancel
+        </button>
+      </span>
+    );
+  }
   return (
     <span className="inline-flex shrink-0 items-center gap-1">
       {state === "error" && <span className="text-[11px] text-sa-err">{error}</span>}
+      {state === "done" && undoLabel && (
+        <span className="text-[11px] text-sa-fg3" data-testid="trace-rewind-undo">
+          undo point: <span className="sa-mono">{undoLabel}</span>
+        </span>
+      )}
       <button
         type="button"
-        onClick={() => void rewind()}
+        onClick={() => setState("confirm")}
         disabled={state === "rewinding" || state === "done"}
         title={`Restore the VM to ${label} — before this step ran`}
         aria-label={`Rewind VM to ${label}`}
         data-testid="trace-rewind"
-        className="inline-flex shrink-0 items-center gap-1 rounded-md border border-sa-line bg-sa-panel px-2 py-1 text-[11px] font-medium text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg disabled:cursor-not-allowed disabled:opacity-50"
+        className={btn}
       >
         {state === "rewinding" ? (
           <Loader2 className="h-3 w-3 animate-spin" aria-hidden />

@@ -51,3 +51,17 @@ test("steps without a checkpoint or without a run never show Rewind", () => {
   );
   assert.equal(countOf(noRun, 'data-testid="trace-rewind"'), 0);
 });
+
+test("RewindButton: first click only asks; confirm row names the undo point", async () => {
+  const { RewindButton } = await import("./RunTraceTimeline");
+  const idle = renderToStaticMarkup(React.createElement(RewindButton, { runId: "run_1", stepSeq: 2, label: "auto-pre-step-2" }));
+  assert.ok(idle.includes('data-testid="trace-rewind"'));
+  assert.ok(!idle.includes("trace-rewind-go"));
+  const confirm = renderToStaticMarkup(
+    React.createElement(RewindButton, { runId: "run_1", stepSeq: 2, label: "auto-pre-step-2", initialState: "confirm" }),
+  );
+  assert.ok(confirm.includes('data-testid="trace-rewind-confirm"'));
+  assert.ok(confirm.includes("undo point"));
+  assert.ok(confirm.includes('data-testid="trace-rewind-go"'));
+  assert.ok(confirm.includes('data-testid="trace-rewind-cancel"'));
+});

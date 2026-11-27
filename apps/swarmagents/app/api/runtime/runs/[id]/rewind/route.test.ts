@@ -119,6 +119,11 @@ test("rewind restores an existing checkpoint into the user's VM", async () => {
   assert.equal(body.stepSeq, 2);
   assert.equal(typeof body.restoredAt, "number");
 
+  // An undo point of the pre-rewind machine was saved and is restorable.
+  assert.match(body.undoLabel as string, /^undo-/);
+  const labels = (await vm.listSnapshots(user)).map((snap) => snap.label);
+  assert.ok(labels.includes(body.undoLabel), "undo snapshot exists");
+
   // The file written after the checkpoint is gone after the rewind.
   await assert.rejects(
     vm.readFile(user, "/workspace/after-checkpoint.txt"),
@@ -139,6 +144,62 @@ test("rewind refuses another user's run and refuses while a run is active", asyn
   const second = manager.start("alice", { prompt: "second", sessionId: "sess_rewind" });
   assert.ok(second.accepted);
   const busy = await rewind(runId, { checkpointSeq: 1 });
-  assert.equal(busy.status, 400);
+  assert.equal(busy.status, 409, "a busy VM is a conflict, not a bad request");
   assert.match((await json(busy)).error as string, /run is active/i);
+});
+
+test("rewind is undoable: restoring the undo point brings back post-checkpoint work", async () => {
+  const { bus, vm, manager } = install();
+  const user = "alice";
+  const runId = await runFixture(manager, bus, user);
+  await vm.snapshot(user, checkpointVmLabel(runId, 3));
+  await vm.writeFile(user, "/workspace/late.txt", "late work");
+
+  const body = await json(await rewind(runId, { checkpointSeq: 3 }));
+  assert.equal(body.ok, true);
+  await vm.restore(user, body.undoLabel);
+  assert.equal(String(await vm.readFile(user, "/workspace/late.txt")), "late work");
+});
+
+test("rewind refuses (and destroys nothing) when no undo point can be saved", async () => {
+  const { bus, vm, manager } = install();
+  const user = "alice";
+  const runId = await runFixture(manager, bus, user);
+  await vm.snapshot(user, checkpointVmLabel(runId, 1));
+  await vm.writeFile(user, "/workspace/keep.txt", "keep me");
+  const original = vm.snapshot.bind(vm);
+  vm.snapshot = async (u: string, label: string) => {
+    if (label.startsWith("undo-")) throw new Error("disk full");
+    return original(u, label);
+  };
+  const res = await rewind(runId, { checkpointSeq: 1 });
+  assert.equal(res.status, 400);
+  assert.match((await json(res)).error as string, /undo point/i);
+  assert.equal(String(await vm.readFile(user, "/workspace/keep.txt")), "keep me");
+});
+
+test("a run submitted during a rewind queues and starts after the restore", async () => {
+  const { bus, vm, manager } = install();
+  const user = "alice";
+  const runId = await runFixture(manager, bus, user);
+  await vm.snapshot(user, checkpointVmLabel(runId, 1));
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const originalRestore = vm.restore.bind(vm);
+  vm.restore = async (u: string, label: string) => {
+    await gate;
+    return originalRestore(u, label);
+  };
+  const pending = rewind(runId, { checkpointSeq: 1 });
+  await new Promise((r) => setTimeout(r, 20));
+  const during = manager.start(user, { prompt: "during rewind", sessionId: "sess_rewind" });
+  assert.ok(during.accepted);
+  assert.equal(during.queued, true, "must not start on a VM that is being recreated");
+  release();
+  assert.equal((await pending).status, 200);
+  await new Promise<void>((resolve) => {
+    bus.subscribe(during.runId, 0, (event: SequencedEvent) => {
+      if (event.type === "run.finished" || event.type === "run.error") resolve();
+    });
+  });
 });

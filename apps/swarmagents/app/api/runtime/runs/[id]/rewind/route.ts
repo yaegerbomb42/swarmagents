@@ -76,7 +76,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const result = await getRuntimeManager().rewind(user, { runId: id, checkpoint });
 
   if (!result.ok) {
-    const status = /not found/i.test(result.error) ? 404 : 400;
+    const status = /not found/i.test(result.error)
+      ? 404
+      : /in progress|active|queued/i.test(result.error)
+        ? 409
+        : 400;
     return NextResponse.json({ error: result.error }, { status });
   }
   return NextResponse.json({
@@ -84,6 +88,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     runId: result.runId,
     checkpointLabel: result.checkpointLabel,
     vmLabel: result.vmLabel,
+    undoLabel: result.undoLabel,
     stepSeq: result.stepSeq,
     restoredAt: result.restoredAt,
   });

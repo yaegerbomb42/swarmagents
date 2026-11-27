@@ -10,6 +10,7 @@ import {
 } from "./lib/rate-limit";
 import { cspValue, securityHeaders, NONCE_HEADER, type SecurityHeadersOptions } from "./lib/security-headers";
 import { isCrossSite } from "./lib/request-policy";
+import { REQUEST_ID_HEADER, formatAccessLogLine, resolveRequestId } from "./lib/request-id";
 
 const NONCE_BYTES = 16;
 
@@ -109,6 +110,28 @@ function redirectOrigin(req: NextRequest): string {
 }
 
 export function middleware(req: NextRequest) {
+  const startedAt = Date.now();
+  const requestId = resolveRequestId(req.headers);
+  const res = runMiddleware(req, requestId);
+  res.headers.set(REQUEST_ID_HEADER, requestId);
+  const { pathname } = req.nextUrl;
+  if (pathname.startsWith("/api/")) {
+    const user = requestUser(req);
+    console.info(
+      formatAccessLogLine({
+        method: req.method,
+        path: pathname,
+        status: res.status,
+        durationMs: Date.now() - startedAt,
+        requestId,
+        userId: user,
+      }),
+    );
+  }
+  return res;
+}
+
+function runMiddleware(req: NextRequest, requestId: string): NextResponse {
   const { pathname, search } = req.nextUrl;
   const dev = process.env.NODE_ENV === "development";
   // Framing policy for this request. The VM preview proxy (/preview/*) is
@@ -131,6 +154,7 @@ export function middleware(req: NextRequest) {
   // down, after the user gate.
   const headers = new Headers(req.headers);
   headers.delete(USER_HEADER);
+  headers.set(REQUEST_ID_HEADER, requestId);
 
   // A rejected origin gets a bare 403 with the hardening headers, no nonce:
   // nothing renders below it, so no CSP-nonce flow is needed. The health

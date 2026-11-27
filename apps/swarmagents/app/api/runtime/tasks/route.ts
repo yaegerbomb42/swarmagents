@@ -14,6 +14,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
+import { jsonErrorWithRequestId } from "../../../../lib/request-id";
 import { USER_HEADER } from "../../../../lib/auth";
 import { getProject, isProjectId, updateProject } from "../../../../lib/projects/store";
 import { buildProjectContext } from "../../../../lib/projects/summary";
@@ -38,13 +39,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function unauthorized() {
-  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+function unauthorized(req: NextRequest) {
+  return jsonErrorWithRequestId(req, { error: "Sign in required." }, { status: 401 });
 }
 
 export async function GET(req: NextRequest) {
   const user = caller(req);
-  if (!user) return unauthorized();
+  if (!user) return unauthorized(req);
   // Cloud runs come from the runtime manager; BYOC jobs live in the remote
   // control plane. Both are per-account, so the client can merge them into one
   // thread list.
@@ -55,26 +56,26 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const user = caller(req);
-  if (!user) return unauthorized();
+  if (!user) return unauthorized(req);
 
   let text: string;
   try {
     text = await req.text();
   } catch {
-    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
+    return jsonErrorWithRequestId(req, { error: "Could not read request body." }, { status: 400 });
   }
   if (text.length > MAX_BODY_SIZE) {
-    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+    return jsonErrorWithRequestId(req, { error: "Request body too large." }, { status: 413 });
   }
 
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return jsonErrorWithRequestId(req, { error: "Invalid JSON body." }, { status: 400 });
   }
   if (!isRecord(body)) {
-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
+    return jsonErrorWithRequestId(req, { error: "Body must be a JSON object." }, { status: 400 });
   }
 
   // Factory reset of the user's VM (the UI sends {action:"wipe_vm"}).
@@ -111,10 +112,10 @@ export async function POST(req: NextRequest) {
 
   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
   if (!prompt) {
-    return NextResponse.json({ error: "prompt is required." }, { status: 400 });
+    return jsonErrorWithRequestId(req, { error: "prompt is required." }, { status: 400 });
   }
   if (prompt.length > MAX_PROMPT_LEN) {
-    return NextResponse.json({ error: "prompt too long." }, { status: 400 });
+    return jsonErrorWithRequestId(req, { error: "prompt too long." }, { status: 400 });
   }
   const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : undefined;
   const agentCard =
@@ -281,7 +282,7 @@ export async function POST(req: NextRequest) {
 
 export async function DELETE(req: NextRequest) {
   const user = caller(req);
-  if (!user) return unauthorized();
+  if (!user) return unauthorized(req);
 
   const runId = new URL(req.url).searchParams.get("runId") ?? undefined;
 

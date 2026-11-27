@@ -14,6 +14,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
+import { jsonErrorWithRequestId } from "../../../lib/request-id";
 import { safeNextPath, sessionCookieOptions, signSession, SESSION_COOKIE } from "../../../lib/auth";
 import {
   verifyLocalUser,
@@ -45,7 +46,8 @@ const NO_STORE = { "cache-control": "no-store" } as const;
 
 export async function POST(req: NextRequest): Promise<Response> {
   if (!process.env.SWARM_SESSION_SECRET) {
-    return NextResponse.json(
+    return jsonErrorWithRequestId(
+      req,
       { error: "Server is not configured for sessions." },
       { status: 500, headers: NO_STORE },
     );
@@ -57,14 +59,14 @@ export async function POST(req: NextRequest): Promise<Response> {
   try {
     const value = await readJsonBody(req, MAX_BODY_SIZE);
     if (!isRecord(value)) {
-      return NextResponse.json({ error: "Invalid request body." }, { status: 400, headers: NO_STORE });
+      return jsonErrorWithRequestId(req, { error: "Invalid request body." }, { status: 400, headers: NO_STORE });
     }
     body = value;
   } catch (err) {
     if (err instanceof JsonBodyError && err.status === 413) {
-      return NextResponse.json({ error: "Request body too large." }, { status: 413, headers: NO_STORE });
+      return jsonErrorWithRequestId(req, { error: "Request body too large." }, { status: 413, headers: NO_STORE });
     }
-    return NextResponse.json({ error: "Invalid request body." }, { status: 400, headers: NO_STORE });
+    return jsonErrorWithRequestId(req, { error: "Invalid request body." }, { status: 400, headers: NO_STORE });
   }
 
   // Per-account and per-IP failed-login budgets, enforced before any
@@ -116,7 +118,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       target: auditLoginFailureTarget(body.email),
       result: "failure",
     });
-    return NextResponse.json({ error: "Invalid credentials." }, { status: 401, headers: NO_STORE });
+    return jsonErrorWithRequestId(req, { error: "Invalid credentials." }, { status: 401, headers: NO_STORE });
   }
 
   refundLoginRateLimit(emailKey, ipKey);

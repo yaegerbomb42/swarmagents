@@ -17,6 +17,7 @@ import { routerQuotaCooldowns } from "@/lib/runtime/llm-routing";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { isApiStyle, isAuthScheme, isPerplexityEffort } from "@/lib/providers/types";
 import type { ModelCapabilities, PerplexityEffort, ProviderAuth } from "@/lib/providers/types";
+import { jsonErrorWithRequestId } from "@/lib/request-id";
 
 export const dynamic = "force-dynamic";
 
@@ -32,7 +33,8 @@ function json(body: unknown, init?: { status?: number }): NextResponse {
   return NextResponse.json(body, { ...init, headers: NO_STORE });
 }
 
-function unauthorized() {
+function unauthorized(req?: Request) {
+  if (req) return jsonErrorWithRequestId(req, { error: "Sign in required." }, { status: 401, headers: NO_STORE });
   return json({ error: "Sign in required." }, { status: 401 });
 }
 
@@ -46,7 +48,7 @@ function unauthorized() {
  */
 export function GET(request: Request) {
   const owner = providerOwner(request);
-  if (!owner) return unauthorized();
+  if (!owner) return unauthorized(request);
   const configured = routerProviders(owner);
   const saved = new Set(savedProviderIds(owner));
   const configuredById = new Map(configured.map((p) => [p.id, p]));
@@ -156,7 +158,7 @@ function isValidKey(key: string): boolean {
 /** Save a provider keyed by id into the caller's account. Returns only a masked summary. */
 export async function POST(request: Request) {
   const owner = providerOwner(request);
-  if (!owner) return unauthorized();
+  if (!owner) return unauthorized(request);
   let body: unknown;
   try {
     body = await readJsonBody(request, MAX_PROVIDER_BODY_BYTES);
@@ -318,7 +320,7 @@ export async function POST(request: Request) {
  */
 export async function PATCH(request: Request) {
   const owner = providerOwner(request);
-  if (!owner) return unauthorized();
+  if (!owner) return unauthorized(request);
   let body: unknown;
   try {
     body = await readJsonBody(request, MAX_PROVIDER_BODY_BYTES);

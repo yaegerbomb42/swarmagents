@@ -2373,3 +2373,23 @@ test("a malformed computer-mcp call does not halt the run: the tool's error goes
   assert.equal(events.some((e) => e.type === "tool.blocked"), false);
   assert.ok(events.some((e) => e.type === "run.finished"), "the run completes");
 });
+
+test("onLine exception emits run.error exactly once and halts the run", async () => {
+  const vm = new ScriptedVm([
+    { chunks: [`${JSON.stringify(INIT)}\n${JSON.stringify(M1)}\n${JSON.stringify(RESULT)}\n`] },
+  ]);
+  const events: TelemetryEvent[] = [];
+  let threw = false;
+  const outcome = await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => {
+    events.push(e);
+    if (e.type === "assistant.text" && !threw) {
+      threw = true;
+      throw new Error("boom inside onLine");
+    }
+  });
+
+  const errors = events.filter((e): e is Extract<TelemetryEvent, { type: "run.error" }> => e.type === "run.error");
+  assert.equal(errors.length, 1, `expected 1 run.error, got ${errors.length}`);
+  assert.match(errors[0].message, /boom inside onLine/);
+  assert.notEqual(outcome.exitCode, 0);
+});

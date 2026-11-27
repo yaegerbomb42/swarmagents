@@ -39,6 +39,7 @@ import {
 import { capClipboardText, writeClipboard } from "./clipboard.mjs";
 import { activeWindowClass, isTerminalClass, pasteText } from "./paste.mjs";
 import { captureWindowText, activeWindowTextSection } from "./window-text.mjs";
+import { diffNewLines, settleTerminal } from "./run-terminal.mjs";
 import {
   effectEnabled,
   captureFingerprint,
@@ -483,6 +484,104 @@ async function withEffect(tool, args, action) {
   return result;
 }
 
+/**
+ * Focus the terminal the command should run in. With `title`, bring the
+ * first window whose title matches to the foreground (xdotool windowactivate,
+ * with wmctrl -a as fallback) and verify it is really a terminal class.
+ * Without it, the active window must already be a terminal class. Returns
+ * `{ ok: true }` or `{ ok: false, error }` — never throws. Everything stays
+ * on the visible desktop: there is no hidden shell.
+ */
+async function focusTerminal(title) {
+  const trimmed = typeof title === "string" ? title.trim() : "";
+  let targetId = null;
+  if (trimmed) {
+    const search = await run("xdotool", ["search", "--name", trimmed], { timeoutMs: 5_000 });
+    if (search.code !== 0 || !search.stdout.trim()) {
+      return { ok: false, error: `no terminal window with title "${trimmed}" found.` };
+    }
+    targetId = Number(search.stdout.trim().split(/\s+/)[0]);
+    const activate = await run("xdotool", ["windowactivate", String(targetId)], { timeoutMs: 5_000 });
+    if (activate.code !== 0) {
+      const viaWmctrl = await run("wmctrl", ["-a", trimmed], { timeoutMs: 5_000 });
+      if (viaWmctrl.code !== 0) {
+        return { ok: false, error: `could not focus window "${trimmed}".` };
+      }
+    }
+  }
+  // Focus changes land asynchronously; wait until the intended window is
+  // active before typing, otherwise keys go to the previous window.
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const act = await run("xdotool", ["getactivewindow"], { timeoutMs: 3_000 });
+    const cur = act.code === 0 ? Number(act.stdout.trim().split(/\s+/)[0]) : NaN;
+    if (Number.isFinite(cur) && cur > 0 && (targetId === null || cur === targetId)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const klass = await activeWindowClass({ env: CHILD_ENV, timeoutMs: 3_000 });
+  if (!isTerminalClass(klass)) {
+    return {
+      ok: false,
+      error: trimmed
+        ? `window "${trimmed}" is not a terminal (class "${klass}").`
+        : "no terminal window is focused: pass title or focus a terminal first (open_app terminal / focus_window).",
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * `run_in_terminal`: focus a visible terminal, type `command` (paste mode for
+ * long/unicode — the same path as `type`), press Return, then poll the
+ * window's OCR text every ~400ms until two consecutive reads are identical
+ * (screen settled) or timeoutS expires. Returns only the lines that appeared
+ * after the command line (diff against the pre-command read; fallback to the
+ * last 40 lines), plus `settled` and elapsed seconds.
+ */
+async function runInTerminal(args) {
+  const title = typeof args.title === "string" ? args.title.trim() : "";
+  const timeoutMs = Math.min(Math.max(Number(args.timeoutS ?? 10), 1), 60) * 1000;
+
+  const focused = await focusTerminal(title);
+  if (!focused.ok) return fail(`run_in_terminal failed: ${focused.error}`);
+
+  // If a previous `type` left text unsubmitted on this terminal's prompt, a
+  // new command typed now would concatenate onto it (core-37). Refuse once
+  // with the same instruction the type path gives, never deadlock.
+  const focus = await focusedTerminal();
+  if (focus.terminal && pendingTerminalLine && pendingTerminalLine.win === focus.win) {
+    const pending = pendingTerminalLine.text.slice(-80);
+    pendingTerminalLine = null; // refuse once
+    return fail(
+      `run_in_terminal refused: "${pending}" is still sitting on this terminal's prompt and never ran (Enter was not pressed). ` +
+        `Call key Return to run it, or key ctrl+u to clear it, then run_in_terminal again.`,
+    );
+  }
+
+  // The pre-command read: the diff anchor for the new lines.
+  const readTerminal = () => captureWindowText({ run, title, maxLines: 80, env: CHILD_ENV });
+  const beforeRes = await readTerminal();
+  if (!beforeRes.ok) return fail(`run_in_terminal failed: ${beforeRes.error}`);
+
+  // Type the command with the existing type path (paste for long/unicode),
+  // then press Return. A trailing newline rides as the Return press.
+  const cmdText = String(args.command).replace(/\n+$/, "") + "\n";
+  const typed = parseToolArgs("type", { text: cmdText });
+  if (!typed.ok) return fail(`run_in_terminal failed: ${typed.error}`);
+  const sent = await typeInto({ text: cmdText }, typed.cmds);
+  if (sent.isError) return sent;
+
+  // Wait for the screen to settle (two identical reads) or timeout.
+  const settleRes = await settleTerminal(readTerminal, { timeoutMs, intervalMs: 400 });
+
+  const fresh = diffNewLines(settleRes.lines, beforeRes.lines);
+  const lines = fresh.lines;
+  const settledLabel = settleRes.settled ? "true" : `false after ${(settleRes.elapsedMs / 1000).toFixed(1)}s (output may still be coming)`;
+  const header = `Terminal "${beforeRes.title}": settled: ${settledLabel}, elapsed: ${(settleRes.elapsedMs / 1000).toFixed(1)}s`;
+  if (lines.length === 0) return textResult(header + "\n(no new output detected)");
+  return textResult(`${header}\n${lines.join("\n")}`);
+}
+
 async function callTool(tool, rawArgs) {
   // Common argument slips (key {"key":"Enter"}, focus_window {"window_name"},
   // open_app {"app_name"}, type {submit:true}) are mapped to the canonical
@@ -551,6 +650,12 @@ async function callTool(tool, rawArgs) {
         if (!res.isError) noteKeyCombo(args.combo);
         return res;
       });
+    case "run_in_terminal": {
+      const res = await runInTerminal(args);
+      // The command runs on Return, so any earlier unsubmitted line is gone.
+      if (!res.isError) pendingTerminalLine = null;
+      return res;
+    }
     default:
       return withEffect(tool, args, () => runAll(parsed.cmds, tool.replace("_", " ")));
   }
@@ -684,6 +789,22 @@ function toolSpec(tool) {
           // schema layer does not strip them before normalizeToolArgs.
           window: z.string().optional(),
           windowTitle: z.string().optional(),
+          name: z.string().optional(),
+        },
+      };
+    case "run_in_terminal":
+      return {
+        description:
+          'Run a command in a visible terminal on the desktop in one call: focus the terminal (the window whose title contains `title`, or the focused window if it is a terminal), type the command (paste mode for long/unicode text), press Return, wait for the screen to settle (two identical reads), and return only the lines that appeared after the command. Prefer this over type + key Return + wait + read_window_text for terminal commands.',
+        shape: {
+          command: z.string().describe("The command to run (max 20000 chars). Return is pressed automatically."),
+          title: z.string().optional().describe("Window title substring of the terminal (default: the focused window if it is a terminal)."),
+          timeoutS: z.union([z.number(), z.string()]).optional().describe("Seconds to wait for output to settle (1..60, default 10)."),
+          timeout: z.union([z.number(), z.string()]).optional().describe("Alias of timeoutS."),
+          window_title: z.string().optional().describe("Alias of title."),
+          window_name: z.string().optional().describe("Alias of title."),
+          windowTitle: z.string().optional(),
+          window: z.string().optional(),
           name: z.string().optional(),
         },
       };

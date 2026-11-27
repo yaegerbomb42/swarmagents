@@ -42,6 +42,10 @@ export function summarizeTool(tool: string, args: Record<string, unknown>): stri
 export const DEFAULT_WINDOW_TEXT_LINES: number;
 /** Hard cap for read_window_text maxLines. */
 export const MAX_WINDOW_TEXT_LINES: number;
+/** Default settle timeout for run_in_terminal, seconds. */
+export const DEFAULT_RUN_IN_TERMINAL_TIMEOUT_S: number;
+/** Hard cap for run_in_terminal timeoutS. */
+export const MAX_RUN_IN_TERMINAL_TIMEOUT_S: number;
 
 /**
  * Parse Tesseract plain-text stdout (`tesseract <img> stdout --psm 6`) into

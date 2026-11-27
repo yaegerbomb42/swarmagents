@@ -15,6 +15,7 @@ VM real control of the on-screen desktop (X display `:1` by default):
 | `drag(x1, y1, x2, y2)` | Left-button drag |
 | `type(text)` | Type text (newlines press Return) |
 | `key(combo)` | Press a key combo, e.g. `ctrl+l`, `Return` |
+| `run_in_terminal(command, title?, timeoutS?)` | One-call terminal command: focus the terminal (title match, else the focused window if it is a terminal), type the command (paste mode for long/unicode), press Return, wait for the screen to settle, and return the new lines |
 | `scroll(dx, dy)` | Scroll by wheel steps (dy>0 down, dx>0 right) |
 | `open_app(name)` | Open `browser` / `terminal` / `files` |
 | `wait(ms)` | Sleep |
@@ -57,6 +58,8 @@ the click. `SWARM_EFFECT_FEEDBACK=0` turns it off. See `effect.mjs`.
 - `window-text.mjs` — ordered in-window text capture for `read_window_text`
   and describe_screen's active-window section (wmctrl geometry + scrot +
   ImageMagick crop + tesseract `--psm 6`).
+- `run-terminal.mjs` — pure diff/settle helpers for `run_in_terminal`
+  (what lines are new, and when two consecutive OCR reads are identical).
 - `effect.mjs` — action-effect fingerprint, settle loop and no-change hint.
 - `atspi_dump.py` — AT-SPI2 tree walker (python3-pyatspi) behind `inspect_ui`
   and the widget section of `describe_screen`. Bounded by node, depth and

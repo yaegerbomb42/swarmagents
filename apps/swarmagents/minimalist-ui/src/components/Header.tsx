@@ -17,6 +17,7 @@ import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
+import { ProviderHealthStrip } from "./ProviderHealthStrip";
 import { StatusPill, type PillTone } from "../design/primitives";
 import { Button, IconButton, Segmented, type SegmentOption } from "./ui";
 
@@ -205,6 +206,7 @@ export function Header({
               24/7
             </span>
           )}
+          <ProviderHealthStrip onOpenProviders={onOpenSettings} />
           <RunIndicator {...run} />
           <Link
             href="/connectors"

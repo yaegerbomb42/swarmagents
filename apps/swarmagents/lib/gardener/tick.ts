@@ -10,6 +10,7 @@ import { readUserGardener, updateUserGardener } from "./store";
 import { normalizeDifficulty } from "../mcp-types";
 import type { BoardTaskInput, GardenerProposal, HotspotInput, QuotaProvider } from "./types";
 import type { TaskDifficulty } from "../mcp-types";
+import { computeUsage } from "../telemetry/usage";
 import { inAutopilotWindow } from "./window";
 
 export interface AutopilotTickInput {
@@ -74,16 +75,28 @@ export function decideAutopilotTick(
   };
 }
 
-function providersFor(userId: string, now: number): QuotaProvider[] {
+export function providersFor(
+  userId: string,
+  now: number,
+  options?: { runsDir?: string | null },
+): QuotaProvider[] {
   const cooldowns = providerQuotaCooldowns(userId);
-  return readConfiguredProviders(userId).map((provider) => ({
+  const configured = readConfiguredProviders(userId);
+  const report = computeUsage({
+    userId,
+    days: 1,
+    providers: configured,
+    ...(options?.runsDir !== undefined ? { runsDir: options.runsDir } : {}),
+  });
+  const spentByProvider = new Map(report.budgets.map((b) => [b.id, b.spentTodayUsd]));
+  return configured.map((provider) => ({
     id: provider.id,
     isFree: provider.isFree,
     baseUrl: provider.baseUrl,
     enabled: provider.enabled,
     dailyBudgetUsd: provider.dailyBudgetUsd,
     quotaExhaustedUntil: cooldowns[provider.id],
-    spentTodayUsd: undefined,
+    spentTodayUsd: spentByProvider.get(provider.id),
   })).map((provider) => {
     if (provider.quotaExhaustedUntil && provider.quotaExhaustedUntil <= now) {
       return { ...provider, quotaExhaustedUntil: undefined };

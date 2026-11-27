@@ -5,6 +5,29 @@ import type { TaskDifficulty } from "../mcp-types";
 import type { GardenerFile, GardenerProposal, GardenerUserState } from "./types";
 
 const DEFAULT_MAX_DIFFICULTY: TaskDifficulty = "medium";
+export const MAX_TERMINAL_PROPOSALS = 100;
+
+export function pruneTerminalProposals(
+  proposals: GardenerProposal[],
+  maxTerminal: number = MAX_TERMINAL_PROPOSALS,
+): GardenerProposal[] {
+  const terminalIndices: Array<{ idx: number; createdAt: number }> = [];
+  for (let i = 0; i < proposals.length; i += 1) {
+    const status = proposals[i].status;
+    if (status === "approved" || status === "dismissed") {
+      terminalIndices.push({ idx: i, createdAt: proposals[i].createdAt });
+    }
+  }
+  if (terminalIndices.length <= maxTerminal) return proposals;
+  // Drop oldest terminal proposals first (lowest createdAt, then earliest index).
+  terminalIndices.sort((a, b) => a.createdAt - b.createdAt || a.idx - b.idx);
+  const dropCount = terminalIndices.length - maxTerminal;
+  const dropped = new Set<number>();
+  for (let i = 0; i < dropCount; i += 1) {
+    dropped.add(terminalIndices[i].idx);
+  }
+  return proposals.filter((_p, i) => !dropped.has(i));
+}
 
 let dirOverride: string | null = null;
 
@@ -81,6 +104,7 @@ export function updateUserGardener(
   const data = loadGardener();
   const state = data.users[userId] ?? emptyUser();
   mutate(state);
+  state.proposals = pruneTerminalProposals(state.proposals);
   state.maxDifficulty = normalizeGardenerDifficulty(state);
   data.users[userId] = state;
   saveGardener(data);

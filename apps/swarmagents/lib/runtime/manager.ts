@@ -1069,7 +1069,19 @@ export interface RunnerLike {
   run(request: RunRequest, onEvent: (event: HarnessEvent) => void): Promise<RunOutcome>;
 }
 
+/**
+ * Snapshot label for the undo point a rewind saves first. Valid per the VM
+ * label rules (lowercase, <= 64 chars); the timestamp suffix keeps it unique.
+ */
+export function rewindUndoLabel(runId: string, now: number): string {
+  const ts = now.toString(36);
+  const base = `undo-${runId.toLowerCase().replace(/[^a-z0-9._-]/g, "-")}`;
+  return `${base.slice(0, 63 - ts.length)}-${ts}`;
+}
+
 export class RuntimeManager {
+  /** Users whose VM is mid-rewind (core-17): runs queue until it finishes. */
+  private readonly rewinding = new Set<string>();
   private readonly vm: VmManager;
   private readonly bus: TelemetryBus;
   private readonly reporter: RunReporter;
@@ -2386,7 +2398,7 @@ export class RuntimeManager {
     // the user's agent VM is not already live. Both waits share the same
     // per-user queue and depth limit; only the reported reason differs.
     const capacityWait = !st.active && !this.vmSlotAvailable(userId, agentId);
-    if (st.active || capacityWait) {
+    if (st.active || capacityWait || this.rewinding.has(userId)) {
       const limit = this.maxQueued();
       if (st.queue.length >= limit) {
         return { accepted: false, runId: "", queued: false, limit };
@@ -2549,10 +2561,103 @@ export class RuntimeManager {
     return { ...started, sourceRunId: input.sourceRunId, checkpointLabel };
   }
 
+  /**
+   * core-17 rewind: restore one of a run's auto-checkpoints into the user's
+   * VM in place — the opposite of fork, which snapshots into a new run. The
+   * workspace rolls back to the checkpoint's known-good state; the run's
+   * telemetry, log, and report are untouched (history is not rewritten, the
+   * *machine* is).
+   *
+   * Refused while a run is active or queued for the user (including a live
+   * team run): a restore recreates the VM under the agent, which would clobber
+   * in-flight work — the same reason a fork queues its seed restore until it
+   * starts. A missing checkpoint is refused with the fork's exact phrasing so
+   * both surfaces behave the same.
+   */
+  async rewind(
+    userId: string,
+    input: {
+      runId: string;
+      /** Step seq (number) or display label ("auto-pre-step-12"). */
+      checkpoint: number | string;
+    },
+  ): Promise<
+    | {
+        ok: true;
+        runId: string;
+        checkpointLabel: string;
+        vmLabel: string;
+        /** Snapshot of the machine as it was right before the rewind (restorable). */
+        undoLabel: string;
+        stepSeq: number;
+        restoredAt: number;
+      }
+    | { ok: false; error: string }
+  > {
+    if (!this.ownsRun(userId, input.runId)) return { ok: false, error: "Run not found." };
+    const stepSeq = resolveCheckpointStepSeq(input.checkpoint);
+    if (stepSeq === null) {
+      return { ok: false, error: "checkpoint must be a step number or an auto-pre-step-<n> label" };
+    }
+    const st = this.users.get(userId);
+    if (st?.active || isTeamRunActive(input.runId)) {
+      return { ok: false, error: "A run is active on this VM. Stop it before rewinding." };
+    }
+    if ((st?.queue.length ?? 0) > 0) {
+      return { ok: false, error: "Runs are queued on this VM. Let them finish before rewinding." };
+    }
+    if (this.rewinding.has(userId)) {
+      return { ok: false, error: "A rewind is already in progress on this VM." };
+    }
+    const checkpointLabel = checkpointDisplayLabel(stepSeq);
+    const vmLabel = checkpointVmLabel(input.runId, stepSeq);
+    // The checkpoint lives in the run's own agent VM (same as fork).
+    const vmOwner = agentOwnerKey(userId, this.agentIdForRun(userId, input.runId));
+    // Hold the VM for the whole restore: a run submitted meanwhile queues
+    // (submit/startNext check this set) instead of starting under a VM that
+    // is about to be recreated. Set synchronously, before the first await.
+    this.rewinding.add(userId);
+    try {
+      let snapshots: { label: string }[];
+      try {
+        snapshots = await this.vm.listSnapshots(vmOwner);
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      if (!snapshots.some((snapshot) => snapshot.label === vmLabel)) {
+        return { ok: false, error: `Checkpoint ${checkpointLabel} not found for run ${input.runId}.` };
+      }
+      // Rewind discards everything after the checkpoint, so save the current
+      // machine first. No undo point, no rewind: never destroy work silently.
+      const undoLabel = rewindUndoLabel(input.runId, Date.now());
+      try {
+        await this.vm.snapshot(vmOwner, undoLabel);
+      } catch (error) {
+        return {
+          ok: false,
+          error: `Could not save an undo point before rewinding: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      try {
+        await this.vm.restore(vmOwner, vmLabel);
+      } catch (error) {
+        return {
+          ok: false,
+          error: `Restore failed (undo point ${undoLabel} kept): ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      return { ok: true, runId: input.runId, checkpointLabel, vmLabel, undoLabel, stepSeq, restoredAt: Date.now() };
+    } finally {
+      this.rewinding.delete(userId);
+      // Anything queued while the VM was held starts now.
+      this.startNext(userId);
+    }
+  }
+
   /** Move the next queued prompt into the active slot and execute it. */
   private startNext(userId: string): void {
     const st = this.users.get(userId);
-    if (!st || st.active) return;
+    if (!st || st.active || this.rewinding.has(userId)) return;
     // Global VM cap: a queued run that needs a fresh VM stays queued until
     // a slot frees (drainCapacityQueue retries it then). A user whose agent
     // VM is already live is never blocked.

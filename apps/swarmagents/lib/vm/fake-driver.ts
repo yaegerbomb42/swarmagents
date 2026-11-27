@@ -453,6 +453,34 @@ export class FakeVmDriver implements VmDriver {
         onStdout(content);
         break;
       }
+      case "find": {
+        // Models the recent-files scan (`recentFindArgv`): files under the
+        // root, pruned dirs skipped, depth-capped, -mmin window, printed as
+        // "<mtime-seconds>\t<size>\t<path>".
+        const root = (rest[0] ?? "/").replace(/\/+$/, "") || "/";
+        const maxDepthIdx = rest.indexOf("-maxdepth");
+        const maxDepth = maxDepthIdx >= 0 ? Number(rest[maxDepthIdx + 1]) : Infinity;
+        const mminIdx = rest.indexOf("-mmin");
+        const mmin = mminIdx >= 0 ? Number(String(rest[mminIdx + 1]).replace(/^-/, "")) : Infinity;
+        const pruned = new Set<string>();
+        for (let i = 0; i < rest.length - 1; i++) if (rest[i] === "-name") pruned.add(rest[i + 1]);
+        const cutoff = Number.isFinite(mmin) ? Date.now() - mmin * 60_000 : -Infinity;
+        const prefix = root === "/" ? "/" : `${root}/`;
+        if (root !== "/" && ![...vm.files.keys()].some((f) => f.startsWith(prefix))) {
+          onStderr(`find: '${root}': No such file or directory\n`);
+          return { exitCode: 1 };
+        }
+        for (const [file, content] of vm.files) {
+          if (!file.startsWith(prefix)) continue;
+          const parts = file.slice(prefix.length).split("/");
+          if (parts.length > maxDepth) continue;
+          if (parts.slice(0, -1).some((seg) => pruned.has(seg))) continue;
+          const mtime = vm.mtimes.get(file) ?? Date.now();
+          if (mtime < cutoff) continue;
+          onStdout(`${(mtime / 1000).toFixed(6)}\t${Buffer.byteLength(content)}\t${file}\n`);
+        }
+        break;
+      }
       case "pwd":
         onStdout("/workspace\n");
         break;

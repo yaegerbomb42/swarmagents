@@ -189,9 +189,15 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [schedules, setSchedules] = useState<ScheduleSummary[]>([]);
   const [seenScheduleRunIds, setSeenScheduleRunIds] = usePersisted<string[]>("sa.seenScheduleRunIds", []);
+  // First time this browser tracks cron runs, start the unread clock now so
+  // existing schedules' past runs are not all flagged unread.
+  const [cronRunsSince, setCronRunsSince] = usePersisted<number>("sa.cronRunsSince", 0);
+  useEffect(() => {
+    if (!cronRunsSince) setCronRunsSince(Date.now());
+  }, [cronRunsSince, setCronRunsSince]);
   const unreadCronRuns = useMemo(
-    () => unreadScheduledRuns(schedules, seenScheduleRunIds),
-    [schedules, seenScheduleRunIds],
+    () => unreadScheduledRuns(schedules, seenScheduleRunIds, cronRunsSince || Number.POSITIVE_INFINITY),
+    [schedules, seenScheduleRunIds, cronRunsSince],
   );
   useEffect(() => {
     if (session.signedOut) {

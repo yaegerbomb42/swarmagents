@@ -16,6 +16,7 @@ import {
   mapStopReason,
   openAIToAnthropicResponse,
   OpenAIStreamTranslator,
+  sanitizeToolJsonSchema,
   stripUnsignedThinking,
   type AnthropicSseEvent,
 } from "./anthropic-bridge";
@@ -1380,6 +1381,198 @@ test("openAIToAnthropicResponse: malformed tool arguments fall back to objects, 
   assert.deepEqual(tools[1].input, {});
 });
 
+// ---------------------------------------------------------------------------
+// sanitizeToolJsonSchema (core-03)
+// ---------------------------------------------------------------------------
+
+/** A Claude-Code-shaped rich schema exercising every sanitizer rule. */
+const richToolSchema = (): Record<string, unknown> => ({
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "tool://write/input",
+  $defs: { Name: { type: "string" } },
+  type: "object",
+  properties: {
+    file_path: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "d".repeat(2600),
+    },
+    mode: { type: "string", format: "uint8", default: "text", examples: ["text"] },
+    digest: { type: "string", format: "uuid" },
+  },
+  required: ["file_path"],
+  additionalProperties: false,
+});
+
+test("sanitizeToolJsonSchema: strips meta keywords and unsupported formats (openai-chat)", () => {
+  const out = sanitizeToolJsonSchema(richToolSchema(), "openai-chat") as Record<string, unknown>;
+  for (const key of ["$schema", "$id", "$defs"]) {
+    assert.equal(key in out, false, `${key} should be stripped`);
+  }
+  const props = out.properties as Record<string, Record<string, unknown>>;
+  // "uint8" is not an OpenAI-wire format; uuid is.
+  assert.equal("format" in props.mode, false);
+  assert.equal(props.digest.format, "uuid");
+  // OpenAI-wire APIs accept default/examples: they stay.
+  assert.equal(props.mode.default, "text");
+  // The original schema object is never mutated.
+  assert.equal("$schema" in richToolSchema(), true);
+});
+
+test("sanitizeToolJsonSchema: flattens trivial nullable anyOf/oneOf wrappers per dialect", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      path: { anyOf: [{ type: "string" }, { type: "null" }] },
+      count: { oneOf: [{ type: "integer" }, { type: "null" }] },
+    },
+  };
+  const openai = sanitizeToolJsonSchema(schema, "openai-chat") as Record<string, unknown>;
+  const openaiProps = openai.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(openaiProps.path, { type: ["string", "null"] });
+  assert.deepEqual(openaiProps.count, { type: ["integer", "null"] });
+
+  const gemini = sanitizeToolJsonSchema(schema, "gemini") as Record<string, unknown>;
+  const geminiProps = gemini.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(geminiProps.path, { type: "string", nullable: true });
+  assert.deepEqual(geminiProps.count, { type: "integer", nullable: true });
+
+  // Ollama's grammar has no null: the variant is dropped entirely.
+  const ollama = sanitizeToolJsonSchema(schema, "ollama") as Record<string, unknown>;
+  const ollamaProps = ollama.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(ollamaProps.path, { type: "string" });
+  assert.deepEqual(ollamaProps.count, { type: "integer" });
+});
+
+test("sanitizeToolJsonSchema: keeps multi-branch anyOf but drops the null branch", () => {
+  const schema = {
+    properties: {
+      value: { anyOf: [{ type: "string" }, { type: "number" }, { type: "null" }] },
+    },
+  };
+  const openai = sanitizeToolJsonSchema(schema, "openai-chat") as Record<string, unknown>;
+  const props = openai.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(props.value.anyOf, [{ type: "string" }, { type: "number" }]);
+  const gemini = sanitizeToolJsonSchema(schema, "gemini") as Record<string, unknown>;
+  const geminiProps = gemini.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(geminiProps.value.anyOf, [{ type: "string" }, { type: "number" }]);
+  assert.equal(geminiProps.value.nullable, true);
+});
+
+test("sanitizeToolJsonSchema: caps only very long descriptions and never drops properties", () => {
+  const properties: Record<string, unknown> = {};
+  for (let i = 0; i < 80; i += 1) properties[`field_${i}`] = { type: "string", description: "short doc" };
+  const schema = {
+    type: "object",
+    description: "x".repeat(2001),
+    properties,
+    required: ["field_0", "field_70", "field_79"],
+  };
+  const out = sanitizeToolJsonSchema(schema, "openai-chat") as Record<string, unknown>;
+  assert.equal((out.description as string).length, 2000);
+  const props = out.properties as Record<string, Record<string, unknown>>;
+  assert.equal(Object.keys(props).length, 80, "every argument survives");
+  assert.deepEqual(out.required, ["field_0", "field_70", "field_79"]);
+  assert.equal(props.field_3.description, "short doc");
+});
+
+test("sanitizeToolJsonSchema: inlines local $refs before stripping $defs (pydantic / zod style)", () => {
+  const schema = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    $defs: {
+      Point: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] },
+    },
+    definitions: { Mode: { type: "string", enum: ["fast", "slow"] } },
+    properties: {
+      start: { $ref: "#/$defs/Point", description: "where to start" },
+      path: { type: "array", items: { $ref: "#/$defs/Point" } },
+      mode: { anyOf: [{ $ref: "#/definitions/Mode" }, { type: "null" }] },
+    },
+    required: ["start"],
+  };
+  for (const dialect of ["openai-chat", "openai-responses", "gemini", "ollama"] as const) {
+    const out = sanitizeToolJsonSchema(schema, dialect) as Record<string, unknown>;
+    const text = JSON.stringify(out);
+    assert.ok(!text.includes("$ref"), `${dialect}: no dangling $ref`);
+    assert.ok(!text.includes("$defs") && !text.includes("definitions"), `${dialect}: defs stripped`);
+    const props = out.properties as Record<string, Record<string, unknown>>;
+    assert.equal(props.start.type, "object");
+    assert.equal(props.start.description, "where to start", "sibling keywords win");
+    assert.deepEqual((props.start.properties as Record<string, unknown>).x, { type: "number" });
+    assert.equal(((props.path.items as Record<string, unknown>).properties as Record<string, unknown>) !== undefined, true);
+    assert.deepEqual(props.mode.enum, ["fast", "slow"]);
+  }
+  assert.ok(JSON.stringify(schema).includes("$ref"), "input not mutated");
+});
+
+test("sanitizeToolJsonSchema: recursive and remote $refs become permissive, never loop", () => {
+  const schema = {
+    type: "object",
+    $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" }, label: { type: "string" } } } },
+    properties: {
+      tree: { $ref: "#/$defs/Node" },
+      remote: { $ref: "https://example.com/schema.json", description: "remote" },
+      missing: { $ref: "#/$defs/Nope" },
+    },
+  };
+  const out = sanitizeToolJsonSchema(schema, "openai-chat") as Record<string, unknown>;
+  const props = out.properties as Record<string, Record<string, unknown>>;
+  assert.equal(props.tree.type, "object");
+  const child = (props.tree.properties as Record<string, Record<string, unknown>>).child;
+  assert.deepEqual(child, {}, "cycle collapses to {}");
+  assert.deepEqual(props.remote, { description: "remote" });
+  assert.deepEqual(props.missing, {});
+});
+
+test("sanitizeToolJsonSchema: caps recursion depth and passes plain values through", () => {
+  let nested: Record<string, unknown> = { type: "string" };
+  for (let i = 0; i < 40; i += 1) nested = { type: "object", properties: { leaf: nested } };
+  const out = sanitizeToolJsonSchema(nested, "openai-chat") as Record<string, unknown>;
+  // The deepest levels collapse to a permissive {} instead of recursing forever.
+  let depth = 0;
+  let cursor: unknown = out;
+  while (cursor !== null && typeof cursor === "object") {
+    const props = (cursor as Record<string, unknown>).properties;
+    cursor = (props as Record<string, unknown> | undefined)?.leaf;
+    depth += 1;
+  }
+  assert.ok(depth <= 20, `depth should be bounded, got ${depth}`);
+
+  assert.deepEqual(sanitizeToolJsonSchema(true, "openai-chat"), true);
+  assert.deepEqual(sanitizeToolJsonSchema(undefined, "gemini"), undefined);
+});
+
+test("anthropicToOpenAI: rich Claude Code tool schema is sanitized for OpenAI", () => {
+  const out = anthropicToOpenAI(
+    {
+      messages: [{ role: "user", content: "write it" }],
+      tools: [{ name: "Write", input_schema: richToolSchema() }],
+    },
+    TARGET_MODEL,
+  );
+  const tools = out.tools as Array<{ function: { parameters: Record<string, unknown> } }>;
+  const parameters = tools[0].function.parameters;
+  assert.equal("$schema" in parameters, false);
+  assert.equal("$id" in parameters, false);
+  const props = parameters.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(props.file_path, { type: ["string", "null"], description: "d".repeat(2000) });
+  assert.equal("format" in props.mode, false);
+});
+
+test("sanitizeToolJsonSchema: collapses type arrays for gemini and ollama", () => {
+  const schema = { type: "object", properties: { v: { type: ["string", "number", "null"] } } };
+  const gemini = sanitizeToolJsonSchema(schema, "gemini") as Record<string, unknown>;
+  const geminiProps = gemini.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(geminiProps.v, { type: "string", nullable: true });
+  const ollama = sanitizeToolJsonSchema(schema, "ollama") as Record<string, unknown>;
+  const ollamaProps = ollama.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(ollamaProps.v, { type: "string" });
+  // OpenAI-wire dialects keep the type array verbatim.
+  const openai = sanitizeToolJsonSchema(schema, "openai-responses") as Record<string, unknown>;
+  const openaiProps = openai.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(openaiProps.v, { type: ["string", "number", "null"] });
+});
+
 test("reasoning_content is only carried for the current turn, never earlier turns", () => {
   const body = {
     messages: [
@@ -1444,4 +1637,64 @@ test("OpenAIStreamTranslator: reasoning after a tool block started never targets
   const thinkingDeltas = events.filter((e) => (e.delta as { type?: string } | undefined)?.type === "thinking_delta");
   assert.equal(thinkingDeltas.length, 1);
   assert.equal((thinkingDeltas[0].delta as { thinking: string }).thinking, "plan");
+});
+
+test("sanitizeToolJsonSchema: real Claude Code tool schemas pass every dialect's rules", () => {
+  // Shapes copied from Claude Code's built-in TodoWrite / Edit tool schemas.
+  const todoWrite = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      todos: {
+        type: "array",
+        description: "The updated todo list",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            content: { type: "string", minLength: 1 },
+            status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+            activeForm: { type: "string", minLength: 1 },
+          },
+          required: ["content", "status", "activeForm"],
+        },
+      },
+    },
+    required: ["todos"],
+  };
+  const edit = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      file_path: { type: "string", description: "The absolute path to the file to modify" },
+      old_string: { type: "string" },
+      new_string: { type: "string" },
+      replace_all: { type: "boolean", default: false, description: "Replace all occurrences" },
+    },
+    required: ["file_path", "old_string", "new_string"],
+  };
+  const keysDeep = (node: unknown, acc = new Set<string>()): Set<string> => {
+    if (Array.isArray(node)) node.forEach((n) => keysDeep(n, acc));
+    else if (node && typeof node === "object") {
+      for (const [k, v] of Object.entries(node)) {
+        if (k !== "properties") acc.add(k);
+        keysDeep(v, acc);
+      }
+    }
+    return acc;
+  };
+  for (const schema of [todoWrite, edit]) {
+    const gemini = keysDeep(sanitizeToolJsonSchema(schema, "gemini"));
+    for (const bad of ["$schema", "additionalProperties", "default"]) assert.ok(!gemini.has(bad), `gemini drops ${bad}`);
+    const ollama = keysDeep(sanitizeToolJsonSchema(schema, "ollama"));
+    assert.ok(!ollama.has("$schema") && !ollama.has("default"));
+    const openai = sanitizeToolJsonSchema(schema, "openai-chat") as Record<string, unknown>;
+    assert.equal(openai.additionalProperties, false, "OpenAI keeps additionalProperties");
+    assert.deepEqual(openai.required, schema.required, "no argument lost");
+  }
+  const gTodo = sanitizeToolJsonSchema(todoWrite, "gemini") as Record<string, any>;
+  assert.deepEqual(gTodo.properties.todos.items.properties.status.enum, ["pending", "in_progress", "completed"]);
+  assert.deepEqual(gTodo.properties.todos.items.required, ["content", "status", "activeForm"]);
 });

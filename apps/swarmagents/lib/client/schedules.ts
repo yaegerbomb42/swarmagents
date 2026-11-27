@@ -79,15 +79,22 @@ export async function fetchSchedules(
   }
 }
 
-/** Return completed scheduled runs whose `lastRunId` is not yet in `seenRunIds`. */
+/**
+ * Return completed scheduled runs whose `lastRunId` is not yet in
+ * `seenRunIds` and that ran at or after `sinceMs` — the moment this browser
+ * started tracking. Without that floor a fresh browser (empty seen list)
+ * would flag every schedule's old last run as unread.
+ */
 export function unreadScheduledRuns(
   schedules: readonly ScheduleSummary[],
   seenRunIds: ReadonlySet<string> | readonly string[],
+  sinceMs = 0,
 ): UnreadScheduledRun[] {
   const seen = seenRunIds instanceof Set ? seenRunIds : new Set(seenRunIds);
   const unread: UnreadScheduledRun[] = [];
   for (const s of schedules) {
     if (!s.lastRunId || !s.lastRunAt) continue;
+    if (s.lastRunAt < sinceMs) continue;
     if (seen.has(s.lastRunId)) continue;
     unread.push({
       scheduleId: s.id,

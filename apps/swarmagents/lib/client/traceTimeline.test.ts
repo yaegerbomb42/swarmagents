@@ -398,3 +398,33 @@ test("tool.blocked settles the matching running call with the blocked label and 
   assert.match(steps[0].label, /Blocked Bash/);
   assert.match(steps[0].label, /VM-only policy/);
 });
+
+// ---- gate checkpoints attach to the guarded step (core-17 rewind) ----
+
+test("a gate checkpoint.created pins its restore point onto the next tool step", () => {
+  const steps = stepsOf([
+    item("checkpoint.created", { label: "auto-pre-step-4", vmLabel: "run_x-auto-pre-step-4", stepSeq: 4, tool: "Bash", reason: "destructive" }, T0, 4),
+    call("c1", "Bash", { command: "rm -rf build" }, T0 + 10, 5),
+    result("c1", "done", T0 + 20, 6),
+  ]);
+  assert.equal(steps.length, 1);
+  assert.deepEqual(steps[0].checkpoint, { stepSeq: 4, label: "auto-pre-step-4" });
+});
+
+test("turn-boundary checkpoints (no tool) never attach to a step", () => {
+  const steps = stepsOf([
+    item("checkpoint.created", { label: "auto-pre-step-2", stepSeq: 2, tool: "", reason: "turn boundary" }, T0, 2),
+    call("c1", "Bash", { command: "ls" }, T0 + 10, 3),
+    result("c1", "", T0 + 20, 4),
+  ]);
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].checkpoint, undefined);
+});
+
+test("a checkpoint with no following call leaves no dangling step", () => {
+  const steps = stepsOf([
+    item("checkpoint.created", { label: "auto-pre-step-9", stepSeq: 9, tool: "Bash" }, T0, 9),
+    item("run.finished", { status: "success" }, T0 + 5, 10),
+  ]);
+  assert.equal(steps.length, 0);
+});

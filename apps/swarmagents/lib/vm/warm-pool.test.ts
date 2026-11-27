@@ -129,3 +129,32 @@ test("VmManager: warm-phase files never survive adoption into the user's VM", as
   const names = listed.map((e) => e.name);
   assert.deepEqual(names, ["user-file.txt"], "workspace was fresh at handoff");
 });
+
+test("VmManager: a configured pool on a driver without prewarm/adoptWarm is reported inert, never silent", async (t) => {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.warn = original;
+  });
+
+  const noPool = new FakeVmDriver();
+  // Shadow the capability, exactly like the docker driver (no prewarm/adoptWarm).
+  (noPool as unknown as { prewarm?: unknown }).prewarm = undefined;
+  const inert = new VmManager({ customDriver: noPool, warmPoolSize: 2 });
+  assert.equal(inert.warmPoolActive, false);
+  assert.equal(inert.warmPoolDepth(), 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], new RegExp(`${SWARM_VM_WARM_POOL_SIZE_ENV}=2 is ignored`));
+
+  warnings.length = 0;
+  const pooled = new VmManager({ customDriver: new FakeVmDriver(), warmPoolSize: 1 });
+  assert.equal(pooled.warmPoolActive, true);
+  assert.equal(warnings.length, 0);
+
+  const off = new VmManager({ customDriver: noPool, warmPoolSize: 0 });
+  assert.equal(off.warmPoolActive, false);
+  assert.equal(warnings.length, 0, "an unset pool never warns");
+});

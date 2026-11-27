@@ -32,6 +32,8 @@ import {
   downloadContentDisposition,
   downloadContentType,
   foldRecentDir,
+  parseRecentFind,
+  recentFindArgv,
   looksBinary,
   parentPath,
   rankRecentFiles,
@@ -92,6 +94,39 @@ async function recentFiles(
   return files;
 }
 
+/** Hard timeout for the single recent-scan `find` exec. */
+const RECENT_FIND_TIMEOUT_MS = 5_000;
+
+/**
+ * Run the recent scan as one `find` inside the VM. Returns `not_live` when
+ * the VM is stopped (no resurrect), and `fallback` when the exec could not
+ * run or exited non-zero (no find, quota slot busy, missing dir) so the
+ * caller can use the listDir walk and its precise error mapping.
+ */
+async function recentViaFind(
+  vm: ReturnType<typeof getVmManager>,
+  user: string,
+  root: string,
+  windowMs: number,
+  since: number,
+): Promise<{ kind: "ok" | "not_live"; files: VmRecentFile[] } | { kind: "fallback" }> {
+  let stdout = "";
+  try {
+    const res = await vm.exec(user, recentFindArgv(root, windowMs), {
+      noResurrect: true,
+      timeoutMs: RECENT_FIND_TIMEOUT_MS,
+      onStdout: (chunk) => {
+        stdout += chunk;
+      },
+    });
+    if (res.exitCode !== 0) return { kind: "fallback" };
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("noResurrect")) return { kind: "not_live", files: [] };
+    return { kind: "fallback" };
+  }
+  return { kind: "ok", files: parseRecentFind(stdout, since) };
+}
+
 /** GET with recent=1: the workspace's recently-touched files. */
 async function recentResponse(req: NextRequest, user: string, url: URL) {
   let path: string;
@@ -112,12 +147,22 @@ async function recentResponse(req: NextRequest, user: string, url: URL) {
   );
   const limit = clampNumber(url.searchParams.get("limit"), MAX_RECENT_FILES, 1, MAX_RECENT_FILES);
   const vm = getVmManager();
+  const since = Date.now() - windowMs;
+  // Fast path: ONE in-VM `find` (pruned, depth-capped) instead of a docker
+  // exec per directory on every poll. noResurrect: a poll must never wake a
+  // hibernated VM — a stopped VM simply has no recent files to show.
+  const fast = await recentViaFind(vm, user, path, windowMs, since);
+  if (fast.kind === "ok" || fast.kind === "not_live") {
+    return NextResponse.json(
+      { path, kind: "recent", since, windowMs, files: rankRecentFiles(fast.files, limit) },
+      { headers: { "cache-control": "no-store" } },
+    );
+  }
   try {
     const stat = await vm.stat(user, path);
     if (stat.type !== "directory") {
       return errorResponse(400, "Path is not a directory.", "not_a_directory");
     }
-    const since = Date.now() - windowMs;
     const found = await recentFiles(vm, user, path, since, { visited: 0 }, 0);
     return NextResponse.json(
       {

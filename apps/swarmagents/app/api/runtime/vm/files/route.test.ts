@@ -406,7 +406,9 @@ test("recent=1 clamps windowMs and limit", async () => {
 });
 
 test("recent=1 rejects unauthenticated requests and bad paths", async () => {
-  install();
+  // Live VM: a missing directory is only knowable (404) when the VM runs; a
+  // stopped VM answers "no recent files" without being woken (test below).
+  await install().ensure("alice");
   const unauth = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1", null));
   assert.equal(unauth.status, 401);
 
@@ -431,4 +433,53 @@ test("recent=1 on a file path is a 400; users only see their own VM", async () =
   assert.equal(bobRes.status, 200);
   const bobBody = await json(bobRes);
   assert.deepEqual(bobBody.files.map((f: any) => f.path), ["/workspace/b.txt"]);
+});
+
+// recent=1 fast path (review follow-up for #321): one in-VM find per poll,
+// no per-directory listDir walk, and a poll never resurrects a stopped VM.
+class FindDriver extends FakeVmDriver {
+  listDirCalls = 0;
+  findCalls = 0;
+  override async listDir(...args: Parameters<FakeVmDriver["listDir"]>) {
+    this.listDirCalls += 1;
+    return super.listDir(...args);
+  }
+  override async exec(...args: Parameters<FakeVmDriver["exec"]>) {
+    const [handle, cmd, opts] = args;
+    if (cmd[0] === "find") {
+      this.findCalls += 1;
+      const t = (Date.now() - 2_000) / 1000;
+      opts?.onStdout?.(`${t.toFixed(6)}\t5\t/workspace/report.csv\n${t.toFixed(6)}\t9\t/workspace/src/app.ts\n`);
+      return { exitCode: 0 };
+    }
+    return super.exec(handle, cmd, opts);
+  }
+}
+
+test("recent=1 uses ONE find exec and no listDir walk", async () => {
+  const driver = new FindDriver();
+  const manager = new VmManager({ customDriver: driver });
+  setVmManagerForTesting(manager);
+  await manager.ensure("alice");
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  const body = await json(res);
+  assert.deepEqual(body.files.map((f: any) => f.path).sort(), ["/workspace/report.csv", "/workspace/src/app.ts"]);
+  assert.equal(driver.findCalls, 1);
+  assert.equal(driver.listDirCalls, 0, "the per-directory walk is not used when find works");
+});
+
+test("recent=1 on a stopped VM returns no files and does not wake it", async () => {
+  const driver = new FindDriver();
+  const manager = new VmManager({ customDriver: driver });
+  setVmManagerForTesting(manager);
+  await manager.ensure("alice");
+  await manager.stop("alice");
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  assert.deepEqual((await json(res)).files, []);
+  assert.equal(driver.findCalls, 0);
+  assert.equal(driver.listDirCalls, 0);
+  const status = await manager.status("alice");
+  assert.notEqual(status, "running", "a recent-files poll must not resurrect the VM");
 });

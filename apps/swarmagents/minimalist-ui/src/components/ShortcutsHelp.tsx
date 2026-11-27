@@ -35,6 +35,7 @@ export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
     entries: [
       { keys: ["⌘/Ctrl", "K"], description: "Focus the composer from any view" },
       { keys: ["⌘/Ctrl", "Shift", "O"], description: "Start a new chat" },
+      { keys: ["⌘/Ctrl", "5"], description: "Show the live desktop" },
       { keys: ["Enter"], description: "Send the message (in the composer)" },
       { keys: ["Shift", "Enter"], description: "Add a new line (in the composer)" },
     ],

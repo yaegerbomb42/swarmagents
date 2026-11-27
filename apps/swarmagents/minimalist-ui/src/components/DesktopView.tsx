@@ -121,6 +121,13 @@ export interface DesktopViewProps {
   canControl?: boolean;
   /** Detail from a vm.error event, for the booting overlay's error copy. */
   vmErrorMessage?: string;
+  /**
+   * Reports the live RFB instance (null once it is gone) so a parent can
+   * drive noVNC APIs DesktopView does not own — the Screen tab's clipboard
+   * paste uses `clipboardPasteFrom`, which is a no-op unless connected and
+   * not view-only. Optional; DesktopView never calls it for its own dials.
+   */
+  onRfb?: (rfb: RFB | null) => void;
 }
 
 const PHASE_OVERLAY_TEXT: Record<string, string> = {
@@ -300,6 +307,7 @@ export function DesktopView({
   loopNudgeAt,
   canControl = true,
   vmErrorMessage,
+  onRfb,
 }: DesktopViewProps) {
   const [conn, dispatch] = useReducer(reduceDesktopConn, INITIAL_DESKTOP_CONN);
   // Control is negotiated server-side: the user expresses INTENT (Take
@@ -324,6 +332,10 @@ export function DesktopView({
   const frameRef = useRef<HTMLDivElement>(null);
   const surfaceHolderRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<RFB | null>(null);
+  // Latest onRfb, read via ref so the dial effect does not re-run when the
+  // parent re-renders with a new callback identity.
+  const onRfbRef = useRef(onRfb);
+  onRfbRef.current = onRfb;
   const modeRef = useRef<DesktopControlMode>(mode);
   const intentRef = useRef(intentControl);
   const replayRunRef = useRef(runId);
@@ -366,6 +378,7 @@ export function DesktopView({
     meterRef.current = null;
     const rfb = rfbRef.current;
     rfbRef.current = null;
+    onRfbRef.current?.(null);
     rfb?.blur();
     rfb?.disconnect();
     if (surfaceHolderRef.current && rfb) {
@@ -433,6 +446,7 @@ export function DesktopView({
       return undefined;
     }
     rfbRef.current = rfb;
+    onRfbRef.current?.(rfb);
     rfb.scaleViewport = true;
     rfb.resizeSession = false;
     rfb.showDotCursor = false;
@@ -468,6 +482,7 @@ export function DesktopView({
       // avoid calling rfb.disconnect() again or noVNC logs a disconnected-state error.
       resizeObserver?.disconnect();
       rfbRef.current = null;
+      onRfbRef.current?.(null);
       meterRef.current?.stop();
       meterRef.current = null;
       if (surfaceHolderRef.current) {

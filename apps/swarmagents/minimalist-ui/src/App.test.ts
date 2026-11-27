@@ -149,13 +149,16 @@ test("the header has a keyboard-shortcuts help button; the panel starts closed",
   assert.equal(countOf(html, 'data-testid="shortcuts-help"'), 0, "the help panel is closed by default");
 });
 
-test("workspace chords map to focus and new chat, never bare keys", async () => {
+test("workspace chords map to focus, new chat and the live desktop, never bare keys", async () => {
   const { workspaceChordAction } = await import("./App");
 
   assert.deepEqual(workspaceChordAction({ key: "k", metaKey: true }), "focusComposer");
   assert.deepEqual(workspaceChordAction({ key: "K", ctrlKey: true }), "focusComposer");
   assert.deepEqual(workspaceChordAction({ key: "o", metaKey: true, shiftKey: true }), "newChat");
   assert.deepEqual(workspaceChordAction({ key: "O", ctrlKey: true, shiftKey: true }), "newChat");
+  // Cmd/Ctrl+5 shows the live desktop tab.
+  assert.deepEqual(workspaceChordAction({ key: "5", metaKey: true }), "showScreen");
+  assert.deepEqual(workspaceChordAction({ key: "5", ctrlKey: true }), "showScreen");
 
   // Plain Ctrl+O (browser open file), bare keys, and other chords are untouched.
   assert.equal(workspaceChordAction({ key: "o", ctrlKey: true }), null);

@@ -60,8 +60,9 @@ import { useSessionPersisted } from "../../store";
 import { cn } from "../../utils/cn";
 import type { DesktopControlMode } from "../../../../lib/client/desktopState";
 import { BrowserView } from "../BrowserView";
-import { DesktopView, type DesktopConnectionInfo } from "../DesktopView";
+import type { DesktopConnectionInfo } from "../DesktopView";
 import { FilesView } from "../FilesView";
+import { ScreenView } from "../ScreenView";
 import { shortPath } from "../../design/vm-tokens";
 import { LiveAppPreviewPill, useIdleChrome, VM_VIEW_TABS, VmFrame, VmStatusBar, type ComputerView } from "./VmChrome";
 import { TerminalView } from "./TerminalView";
@@ -465,7 +466,7 @@ export function VmScreen({
             className={cn("absolute inset-0", selectedView === "desktop" ? "block" : "hidden")}
             data-testid="vm-view-desktop"
           >
-            <DesktopView
+            <ScreenView
               vmState={vmDisplay.state}
               vmResetting={vmResetting}
               runActive={liveRun}
@@ -475,7 +476,6 @@ export function VmScreen({
               presence={effectivePresence}
               computerAction={effectiveComputerAction}
               loopNudgeAt={effectiveLoopNudgeAt}
-              embedded
               control={control}
               onControlChange={onControlChange}
               canControl={canControl}

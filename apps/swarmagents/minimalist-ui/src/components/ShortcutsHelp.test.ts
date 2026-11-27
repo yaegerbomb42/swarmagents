@@ -19,7 +19,7 @@ for (const group of SHORTCUT_GROUPS) {
 }
 
 test("the help panel lists exactly the shortcuts the console supports", () => {
-  assert.equal(KEYS_TO_ENTRY.size, 9, "the accepted set of shortcuts, no more, no less");
+  assert.equal(KEYS_TO_ENTRY.size, 10, "the accepted set of shortcuts, no more, no less");
   // The set is pinned on purpose: it must mirror what the code actually wires
   // (App.tsx chords + Esc, Composer.tsx Enter/Shift+Enter, ApprovalGate.tsx
   // A/D/Shift+A, ComputerScreen.tsx Ctrl+C). If a shortcut changes, update
@@ -32,6 +32,7 @@ test("the help panel lists exactly the shortcuts the console supports", () => {
     "Esc",
     "Shift+A",
     "Shift+Enter",
+    "⌘/Ctrl+5",
     "⌘/Ctrl+K",
     "⌘/Ctrl+Shift+O",
   ]);

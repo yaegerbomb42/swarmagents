@@ -433,7 +433,8 @@ const PREVIEW_SHARE_TOKEN = "a".repeat(48);
 async function makeProxy(opts: {
   idleMs?: number;
   maxViewers?: number;
-  endpoints?: HarnessEndpoints;
+  // Partial: makeProxy fills alice/bob/carol defaults; callers only override what they need.
+  endpoints?: Partial<HarnessEndpoints>;
   resolveGuest?: (token: string) => Promise<string | null>;
   resolvePreviewTarget?: (userId: string, port: number) => Promise<PreviewTarget | null>;
   resolvePreviewShare?: (token: string) => PreviewShareOwner | null;

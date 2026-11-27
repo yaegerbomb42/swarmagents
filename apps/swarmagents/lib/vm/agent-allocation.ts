@@ -81,7 +81,8 @@ function parseNonNegativeNumber(raw: string | undefined, fallback: number): numb
  */
 export function resolveAgentVmConfig(
   opts?: Partial<AgentVmConfig>,
-  env: NodeJS.ProcessEnv = process.env,
+  // Partial: callers only ever read optional SWARM_VM_* vars; tests pass sparse envs.
+  env: Partial<NodeJS.ProcessEnv> = process.env,
 ): AgentVmConfig {
   const maxAgentVms =
     opts?.maxAgentVms ??

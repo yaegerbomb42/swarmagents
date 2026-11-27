@@ -531,6 +531,7 @@ export function VmScreen({
               changedAt={effectivePresence.changedAt}
               presence={effectivePresence}
               live={liveRun}
+              streamItems={stream.items}
             />
           </div>
         )}

@@ -39,6 +39,12 @@ export async function register(): Promise<void> {
       // request handler.
       const { startScheduleTicks } = await import("./lib/runtime/schedules");
       startScheduleTicks();
+      // Always-on A1 idle loop: only when explicitly enabled
+      // (SWARM_A1_IDLE_LOOP=1, default off). The ticker itself re-reads the
+      // always-on user list every tick, so it is a no-op until a user is
+      // listed in SWARM_VM_ALWAYS_ON_USERS.
+      const { startIdleLoopTicks } = await import("./lib/harness/idle-loop");
+      startIdleLoopTicks();
     }
     // Next.js route handlers cannot upgrade WebSockets, so the owner-only
     // desktop proxy (lib/desktop-proxy) runs as a small dedicated Node server

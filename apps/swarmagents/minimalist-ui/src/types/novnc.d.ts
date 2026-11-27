@@ -31,6 +31,8 @@ declare module "@novnc/novnc/lib/rfb" {
     showDotCursor: boolean;
     focus(options?: { preventScroll?: boolean }): void;
     blur(): void;
+    /** Paste clipboard text into the guest; no-op unless connected and not view-only. */
+    clipboardPasteFrom(text: string): void;
     sendCtrlAltDel(): void;
     get capabilities(): Record<string, unknown>;
     addEventListener(type: string, listener: (ev: CustomEvent) => void): void;

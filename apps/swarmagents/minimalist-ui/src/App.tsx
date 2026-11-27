@@ -90,13 +90,14 @@ export function shouldToastRunCompletion(input: {
   );
 }
 
-export type WorkspaceChord = "focusComposer" | "newChat";
+export type WorkspaceChord = "focusComposer" | "newChat" | "showScreen";
 
 /**
  * The workspace's modifier-chord shortcuts, kept pure so tests can pin the
  * mapping without a DOM. Cmd/Ctrl+K focuses the composer; Cmd/Ctrl+Shift+O
- * starts a new chat. Plain Cmd/Ctrl+O is left alone (it is the browser's
- * "open file"). Bare keys never map here — typing must be unaffected.
+ * starts a new chat; Cmd/Ctrl+5 shows the live desktop tab. Plain Cmd/Ctrl+O
+ * is left alone (it is the browser's "open file"). Bare keys never map here
+ * — typing must be unaffected.
  */
 export function workspaceChordAction(event: {
   key: string;
@@ -108,6 +109,7 @@ export function workspaceChordAction(event: {
   const key = event.key.toLowerCase();
   if (key === "k") return "focusComposer";
   if (key === "o" && event.shiftKey) return "newChat";
+  if (key === "5") return "showScreen";
   return null;
 }
 /** The activity suffix under the workspace label: what the agent is doing, or the computer's state. */
@@ -482,11 +484,12 @@ export default function App() {
     [setView],
   );
 
-  // Cmd/Ctrl+K focus (unchanged), Cmd/Ctrl+Shift+O new chat. Esc closes the
-  // console's own overlays — history, settings, the shortcuts help — the way
-  // every other overlay in the app closes (the Sheet component handles its own
-  // Esc; this fallback covers the ones App owns). Bare keys are never handled
-  // here, so typing in the composer is unaffected.
+  // Cmd/Ctrl+K focus (unchanged), Cmd/Ctrl+Shift+O new chat, Cmd/Ctrl+5
+  // Screen tab. Esc closes the console's own overlays — history, settings,
+  // the shortcuts help — the way every other overlay in the app closes (the
+  // Sheet component handles its own Esc; this fallback covers the ones App
+  // owns). Bare keys are never handled here, so typing in the composer is
+  // unaffected.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const action = workspaceChordAction(event);
@@ -502,6 +505,12 @@ export default function App() {
         handleNewChat();
         return;
       }
+      if (action === "showScreen") {
+        event.preventDefault();
+        setView("screen");
+        setScreenView("desktop");
+        return;
+      }
       if (event.key !== "Escape") return;
       if (shortcutsOpen) setShortcutsOpen(false);
       else if (settings.open) closeSettings();
@@ -509,7 +518,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [wide, setView, focusComposer, handleNewChat, busy, shortcutsOpen, settings.open, closeSettings, historyOpen]);
+  }, [wide, setView, setScreenView, focusComposer, handleNewChat, busy, shortcutsOpen, settings.open, closeSettings, historyOpen]);
 
   // ---- Layout configuration ----
 

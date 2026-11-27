@@ -52,7 +52,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { handleCreateTask } from "../board/handlers";
 import { getStoragePaths, loadStore } from "../board/store";
@@ -876,19 +876,31 @@ export function extractCompletionText(body: unknown): string {
   return "";
 }
 
+/** System locations for the git binary. Spawning by bare name resolves via
+ * PATH, which a writable entry could shadow (Sonar S4036); a literal fixed
+ * PATH in `env` did not satisfy the check, so the binary is resolved to an
+ * absolute path instead and no PATH lookup happens at all. */
+const GIT_PATHS = ["/usr/bin/git", "/usr/local/bin/git"] as const;
+
+function resolveGitPath(): string | undefined {
+  for (const candidate of GIT_PATHS) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // ignore unreadable candidates
+    }
+  }
+  return undefined;
+}
+
 function recentCommitsBestEffort(limit = MAX_DIGEST_ITEMS): string[] {
+  const gitPath = resolveGitPath();
+  if (!gitPath) return [];
   try {
-    // Fixed PATH (system dirs only): spawning `git` by bare name with an
-    // inherited PATH would let a writable PATH entry shadow the binary.
-    // The env is a literal on purpose: Sonar S4036 only accepts a fixed
-    // PATH, not a spread of process.env (which could carry a tainted PATH).
-    // `git log` needs nothing else from the environment; NODE_ENV is
-    // carried over as a scalar because the repo's ProcessEnv requires it.
-    const out = execFileSync("git", ["log", `--oneline`, `-${limit}`], {
+    const out = execFileSync(gitPath, ["log", `--oneline`, `-${limit}`], {
       encoding: "utf8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
-      env: { NODE_ENV: process.env.NODE_ENV ?? "development", PATH: "/usr/local/bin:/usr/bin:/bin" },
     });
     return out
       .split("\n")

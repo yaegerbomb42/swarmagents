@@ -880,11 +880,15 @@ function recentCommitsBestEffort(limit = MAX_DIGEST_ITEMS): string[] {
   try {
     // Fixed PATH (system dirs only): spawning `git` by bare name with an
     // inherited PATH would let a writable PATH entry shadow the binary.
+    // The env is a literal on purpose: Sonar S4036 only accepts a fixed
+    // PATH, not a spread of process.env (which could carry a tainted PATH).
+    // `git log` needs nothing else from the environment; NODE_ENV is
+    // carried over as a scalar because the repo's ProcessEnv requires it.
     const out = execFileSync("git", ["log", `--oneline`, `-${limit}`], {
       encoding: "utf8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, PATH: "/usr/local/bin:/usr/bin:/bin" },
+      env: { NODE_ENV: process.env.NODE_ENV ?? "development", PATH: "/usr/local/bin:/usr/bin:/bin" },
     });
     return out
       .split("\n")

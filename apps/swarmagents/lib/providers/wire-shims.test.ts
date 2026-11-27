@@ -343,6 +343,181 @@ test("anthropicToOllama: is_error passes through and max_tokens clamps to num_pr
   assert.equal((out.options as Record<string, unknown>).num_predict, 4_096);
 });
 
+test("responsesEventToChunks maps reasoning summary deltas to reasoning_content", () => {
+  const state = newResponsesStreamState("gpt-5");
+  const marked = responsesEventToChunks(
+    { type: "response.reasoning_summary_part.added", item: { type: "reasoning" } },
+    state,
+  );
+  assert.deepEqual(marked, [], "part markers carry no text");
+
+  const delta = responsesEventToChunks(
+    { type: "response.reasoning_summary_text.delta", delta: "weigh the options" },
+    state,
+  );
+  assert.deepEqual(delta[0]?.choices[0]?.delta, { reasoning_content: "weigh the options" });
+
+  const done = responsesEventToChunks({ type: "response.reasoning_summary_text.done" }, state);
+  assert.deepEqual(done, []);
+});
+
+test("responsesToOpenAIResponse carries reasoning items as reasoning_content", () => {
+  const out = responsesToOpenAIResponse(
+    {
+      id: "resp_2",
+      model: "gpt-5",
+      status: "completed",
+      output: [
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "check the files" }],
+        },
+        { type: "message", content: [{ type: "output_text", text: "done" }] },
+      ],
+      usage: { input_tokens: 8, output_tokens: 3 },
+    },
+    "fallback",
+  );
+  const choice = (out.choices as Record<string, unknown>[])[0] as {
+    message: Record<string, unknown>;
+  };
+  assert.equal(choice.message.content, "done");
+  assert.equal(choice.message.reasoning_content, "check the files");
+});
+
+test("ollama thinking round-trips through reasoning_content", () => {
+  // Request: the chat translation's reasoning_content becomes the native
+  // Ollama `thinking` field on the assistant message.
+  const out = anthropicToOllama(
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "list first" },
+            { type: "tool_use", id: "t1", name: "shell", input: { cmd: "ls" } },
+          ],
+        },
+      ],
+    },
+    "qwen3:8b",
+    { reasoningContent: true },
+  );
+  const messages = out.messages as Record<string, unknown>[];
+  assert.equal(messages[0]?.thinking, "list first");
+  assert.ok(Array.isArray(messages[0]?.tool_calls));
+
+  // Without the flag the thinking block is stripped, as for every provider.
+  const stripped = anthropicToOllama(
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "list first" }, { type: "text", text: "hi" }],
+        },
+      ],
+    },
+    "qwen3:8b",
+  );
+  assert.equal("thinking" in (stripped.messages as Record<string, unknown>[])[0], false);
+
+  // Non-streaming response: `message.thinking` becomes reasoning_content.
+  const body = ollamaToOpenAIResponse(
+    { model: "qwen3:8b", message: { content: "done", thinking: "listed them" } },
+    "fallback",
+  );
+  const choice = (body.choices as Record<string, unknown>[])[0] as {
+    message: Record<string, unknown>;
+  };
+  assert.equal(choice.message.content, "done");
+  assert.equal(choice.message.reasoning_content, "listed them");
+
+  // Streaming: a `thinking` line maps to a reasoning_content delta.
+  const state = newOllamaStreamState("qwen3:8b");
+  const chunks = ollamaLineToChunks(
+    { message: { content: "done", thinking: "listed them" }, done: false },
+    state,
+  );
+  assert.deepEqual(chunks[0]?.choices[0]?.delta, { reasoning_content: "listed them" });
+  assert.deepEqual(chunks[1]?.choices[0]?.delta, { content: "done" });
+});
+
+test("gemini thought parts round-trip through reasoning_content", () => {
+  // Request: Anthropic thinking blocks become Gemini `thought` parts, with
+  // the extended-thinking signature carried as thoughtSignature.
+  const out = anthropicToGemini(
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "weigh it", signature: "sig_abc" },
+            { type: "text", text: "thinking it over" },
+          ],
+        },
+      ],
+    },
+    "gemini-2.5-pro",
+  );
+  const contents = out.contents as Record<string, unknown>[];
+  assert.equal(contents[0]?.role, "model");
+  const parts = contents[0]?.parts as Record<string, unknown>[];
+  assert.deepEqual(parts[0], { text: "weigh it", thought: true, thoughtSignature: "sig_abc" });
+  assert.deepEqual(parts[1], { text: "thinking it over" });
+
+  // Non-streaming response: thought parts become reasoning_content, never
+  // visible text.
+  const body = geminiToOpenAIResponse(
+    {
+      modelVersion: "gemini-2.5-pro",
+      candidates: [
+        {
+          content: {
+            parts: [{ text: "weigh it", thought: true }, { text: "done" }],
+          },
+          finishReason: "STOP",
+        },
+      ],
+      usageMetadata: { promptTokenCount: 6, candidatesTokenCount: 2 },
+    },
+    "fallback",
+  );
+  const choice = (body.choices as Record<string, unknown>[])[0] as {
+    message: Record<string, unknown>;
+  };
+  assert.equal(choice.message.content, "done");
+  assert.equal(choice.message.reasoning_content, "weigh it");
+
+  // Streaming: a thought part maps to a reasoning_content delta.
+  const state = newGeminiStreamState("gemini-2.5-pro");
+  const chunks = geminiChunkToChunks(
+    { candidates: [{ content: { parts: [{ text: "weigh it", thought: true }] } }] },
+    state,
+  );
+  assert.deepEqual(chunks[0]?.choices[0]?.delta, { reasoning_content: "weigh it" });
+});
+
+test("anthropicToGemini drops cache_control and thinking in user messages", () => {
+  const out = anthropicToGemini(
+    {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "hi", cache_control: { type: "ephemeral" } },
+            { type: "thinking", thinking: "not mine" },
+          ],
+        },
+      ],
+    },
+    "gemini-2.5-pro",
+  );
+  assert.ok(!JSON.stringify(out).includes("cache_control"));
+  assert.ok(!JSON.stringify(out).includes("thought"));
+  const contents = out.contents as Record<string, unknown>[];
+  assert.deepEqual(contents[0]?.parts, [{ text: "hi" }]);
+});
+
 test("anthropicToGemini: is_error, tool_choice and max_tokens clamp map natively", () => {
   const body = anthropicBody();
   (body.messages[2]!.content as Record<string, unknown>[])[0]!.is_error = true;

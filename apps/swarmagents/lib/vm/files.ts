@@ -207,3 +207,148 @@ export function looksBinary(bytes: Uint8Array): boolean {
   }
   return control / limit > 0.3;
 }
+
+// ---------------------------------------------------------------------------
+// Recently-modified files (GET /api/runtime/vm/files?recent=1)
+// ---------------------------------------------------------------------------
+
+/** Hard cap on the files a recent-scan returns. */
+export const MAX_RECENT_FILES = 25;
+/** Hard cap on filesystem entries visited by one recent-scan walk. */
+export const MAX_RECENT_WALK_ENTRIES = 2_000;
+/** Hard cap on directory depth for the recent-scan walk. */
+export const MAX_RECENT_WALK_DEPTH = 4;
+/** Default look-back window for the recent scan (15 minutes of agent work). */
+export const DEFAULT_RECENT_WINDOW_MS = 15 * 60_000;
+/** Hard cap on the look-back window (one hour) — never a whole-workspace scan. */
+export const MAX_RECENT_WINDOW_MS = 60 * 60_000;
+
+/** One recently-modified workspace file as the recent-scan reports it. */
+export interface VmRecentFile {
+  name: string;
+  path: string;
+  size: number;
+  modifiedAt: number;
+  /** Inline-safe Content-Type for an <img>/preview render. */
+  contentType: string;
+}
+
+/**
+ * Fold one directory level into a recent-scan. Pure: takes the already-listed
+ * entries plus the running walk budget and returns the files that qualify
+ * (modified inside the window) and the subdirectories still to visit, without
+ * exceeding the entry budget. Directories carry no modifiedAt of their own.
+ */
+export function foldRecentDir(
+  entries: VmDirEntryLike[],
+  since: number,
+  budget: { visited: number },
+): { files: VmRecentFile[]; subdirs: string[] } {
+  const files: VmRecentFile[] = [];
+  const subdirs: string[] = [];
+  for (const entry of entries) {
+    budget.visited += 1;
+    if (entry.type === "directory") {
+      if (!RECENT_SCAN_PRUNE_DIRS.includes(entry.name)) subdirs.push(entry.path);
+      continue;
+    }
+    if (typeof entry.modifiedAt !== "number" || !Number.isFinite(entry.modifiedAt)) continue;
+    if (entry.modifiedAt < since) continue;
+    files.push({
+      name: entry.name,
+      path: entry.path,
+      size: entry.size,
+      modifiedAt: entry.modifiedAt,
+      contentType: downloadContentType(entry.name),
+    });
+  }
+  return { files, subdirs };
+}
+
+/** Minimal entry shape the recent fold needs (subset of the driver's VmDirEntry). */
+export interface VmDirEntryLike {
+  name: string;
+  path: string;
+  type: string;
+  size: number;
+  modifiedAt?: number;
+}
+
+/** Directory names a recent-scan never descends into (dependency / VCS / cache trees). */
+export const RECENT_SCAN_PRUNE_DIRS = Object.freeze([
+  "node_modules",
+  ".git",
+  ".cache",
+  ".next",
+  "__pycache__",
+  ".venv",
+]);
+
+/**
+ * argv for ONE in-VM `find` that returns the files under `root` modified in
+ * the last `windowMs`, as `<mtime>\t<size>\t<path>` lines. Replaces the
+ * per-directory listDir walk (one docker exec per folder, every poll) with a
+ * single exec; heavy trees are pruned, depth is capped. argv only, no shell.
+ */
+export function recentFindArgv(root: string, windowMs: number): string[] {
+  const minutes = Math.max(1, Math.ceil(windowMs / 60_000));
+  const prune: string[] = [];
+  RECENT_SCAN_PRUNE_DIRS.forEach((name, i) => {
+    if (i > 0) prune.push("-o");
+    prune.push("-name", name);
+  });
+  return [
+    "find",
+    root,
+    "-maxdepth",
+    String(MAX_RECENT_WALK_DEPTH + 1),
+    "-mindepth",
+    "1",
+    "(",
+    ...prune,
+    ")",
+    "-prune",
+    "-o",
+    "-type",
+    "f",
+    "-mmin",
+    `-${minutes}`,
+    "-printf",
+    "%T@\\t%s\\t%p\\n",
+  ];
+}
+
+/**
+ * Parse `recentFindArgv` output into recent files modified at or after
+ * `since`. Malformed lines are skipped; at most MAX_RECENT_WALK_ENTRIES
+ * lines are considered so a pathological workspace stays bounded.
+ */
+export function parseRecentFind(stdout: string, since: number): VmRecentFile[] {
+  const files: VmRecentFile[] = [];
+  const lines = stdout.split("\n");
+  for (let i = 0; i < lines.length && i < MAX_RECENT_WALK_ENTRIES; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    const first = line.indexOf("\t");
+    const second = first < 0 ? -1 : line.indexOf("\t", first + 1);
+    if (first < 0 || second < 0) continue;
+    const modifiedAt = Math.round(Number(line.slice(0, first)) * 1000);
+    const size = Number(line.slice(first + 1, second));
+    const path = line.slice(second + 1);
+    if (!Number.isFinite(modifiedAt) || !path || modifiedAt < since) continue;
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    files.push({
+      name,
+      path,
+      size: Number.isFinite(size) ? size : 0,
+      modifiedAt,
+      contentType: downloadContentType(name),
+    });
+  }
+  return files;
+}
+
+/** Sort candidates most-recent-first and keep the response cap. */
+export function rankRecentFiles(files: VmRecentFile[], limit: number): VmRecentFile[] {
+  return [...files].sort((a, b) => b.modifiedAt - a.modifiedAt || a.path.localeCompare(b.path)).slice(0, Math.max(1, limit));
+}

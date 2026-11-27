@@ -20,7 +20,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { VM_BROWSER_PROFILE_PATH, VM_WORKSPACE_DISK_PATH } from "./manager.js";
+import { CHROMIUM_SINGLETON_LOCKS, VM_BROWSER_PROFILE_PATH, VM_WORKSPACE_DISK_PATH, VmManager } from "./manager.js";
 import {
   DockerVmDriver,
   containerNameFor,
@@ -108,4 +108,28 @@ test("driver reset() is the only path that wipes the workspace volume", async ()
   const volumeRm = calls.find((c) => c.args[0] === "volume" && c.args[1] === "rm");
   assert.ok(volumeRm, "reset removes the volume");
   assert.equal(volumeRm.args[3], volumeNameFor(userId), "reset removes exactly this user's workspace volume");
+});
+
+test("VmManager.ensure clears stale Chromium SingletonLock files on container boot", async () => {
+  const execCalls: string[][] = [];
+  const fakeDriver = {
+    async ensure(userId: string) {
+      return handleFor(userId);
+    },
+    async exec(_handle: VmHandle, cmd: string[]) {
+      execCalls.push(cmd);
+      return { exitCode: 0 };
+    },
+    async stop() {},
+    async reset() {},
+    async readFile() {
+      return Buffer.alloc(0);
+    },
+    async writeFile() {},
+  };
+  const manager = new VmManager({ customDriver: fakeDriver as never, warmPoolSize: 0 });
+  await manager.cleanStaleBrowserLocks("u1");
+  const lockCleanup = execCalls.find((cmd) => cmd[0] === "rm" && cmd.includes(CHROMIUM_SINGLETON_LOCKS[0]));
+  assert.ok(lockCleanup, "cleanStaleBrowserLocks removes stale SingletonLock, SingletonCookie, and SingletonSocket");
+  assert.deepEqual(lockCleanup, ["rm", "-f", "--", ...CHROMIUM_SINGLETON_LOCKS]);
 });

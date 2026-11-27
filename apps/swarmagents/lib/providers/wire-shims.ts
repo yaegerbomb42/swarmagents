@@ -248,6 +248,7 @@ export function responsesToOpenAIResponse(body: unknown, requestedModel: string)
   const root = isRecord(body) ? body : {};
   const output = Array.isArray(root.output) ? root.output : [];
   let text = asString(root.output_text) ?? "";
+  let reasoning = "";
   const toolCalls: Record<string, unknown>[] = [];
   for (const raw of output) {
     const item = isRecord(raw) ? raw : {};
@@ -255,6 +256,15 @@ export function responsesToOpenAIResponse(body: unknown, requestedModel: string)
       for (const part of item.content) {
         const p = isRecord(part) ? part : {};
         if (p.type === "output_text" || p.type === "text") text += asString(p.text) ?? "";
+      }
+    } else if (item.type === "reasoning") {
+      // Reasoning items carry the model's chain-of-thought as summary
+      // text; normalize it to `reasoning_content` so the Anthropic bridge
+      // maps it back to a `thinking` block.
+      const summary = Array.isArray(item.summary) ? item.summary : [];
+      for (const s of summary) {
+        const sp = isRecord(s) ? s : {};
+        if (typeof sp.text === "string") reasoning += sp.text;
       }
     } else if (item.type === "function_call") {
       toolCalls.push({
@@ -277,6 +287,7 @@ export function responsesToOpenAIResponse(body: unknown, requestedModel: string)
         message: {
           role: "assistant",
           ...(text ? { content: text } : { content: "" }),
+          ...(reasoning.length > 0 ? { reasoning_content: reasoning } : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: finishReason,
@@ -384,6 +395,28 @@ export function responsesEventToChunks(event: unknown, state: ResponsesStreamSta
         choices: [{ index: 0, delta: { content: delta } }],
       });
     }
+    return out;
+  }
+
+  // Reasoning summary streams (`response.reasoning_summary_text.delta`,
+  // and `response.reasoning_text.delta` from gateways that use it) carry
+  // the model's chain-of-thought; normalize them to `reasoning_content`
+  // deltas so the Anthropic bridge emits `thinking_delta` events. The
+  // part-added/done markers carry no text and emit nothing.
+  if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+    const delta = asString(root.delta) ?? "";
+    if (delta) {
+      out.push({
+        model: state.model,
+        choices: [{ index: 0, delta: { reasoning_content: delta } }],
+      });
+    }
+    return out;
+  }
+  if (
+    type === "response.reasoning_summary_part.added" ||
+    type === "response.reasoning_summary_text.done"
+  ) {
     return out;
   }
 
@@ -530,9 +563,15 @@ export function anthropicToOllama(
     }
     if (role === "assistant") {
       const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      // The chat translation carries prior reasoning as `reasoning_content`
+      // when the target preserves it; Ollama thinking models accept the
+      // same text in the assistant message's native `thinking` field, so
+      // the reasoning survives across multi-turn tool loops there too.
+      const reasoning = asString(message.reasoning_content);
       messages.push({
         role: "assistant",
         content: contentText(message.content),
+        ...(reasoning !== undefined && reasoning.length > 0 ? { thinking: reasoning } : {}),
         ...(calls.length > 0
           ? {
               tool_calls: calls.map((rawCall) => {
@@ -607,6 +646,10 @@ export function ollamaToOpenAIResponse(body: unknown, requestedModel: string): R
   const root = isRecord(body) ? body : {};
   const message = isRecord(root.message) ? root.message : {};
   const text = asString(message.content) ?? "";
+  // Ollama thinking models report chain-of-thought in `message.thinking`;
+  // carry it as `reasoning_content` so the Anthropic bridge maps it back
+  // to a `thinking` block (see anthropic-bridge.ts).
+  const thinking = asString(message.thinking);
   const toolCalls: Record<string, unknown>[] = [];
   if (Array.isArray(message.tool_calls)) {
     message.tool_calls.forEach((raw, index) => {
@@ -628,6 +671,9 @@ export function ollamaToOpenAIResponse(body: unknown, requestedModel: string): R
         message: {
           role: "assistant",
           content: text,
+          ...(thinking !== undefined && thinking.length > 0
+            ? { reasoning_content: thinking }
+            : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
@@ -657,6 +703,14 @@ export function ollamaLineToChunks(line: unknown, state: OllamaStreamState): Ope
   if (isRecord(root.error)) throw new Error(asString(root.error.message) ?? "Ollama stream failed.");
   const message = isRecord(root.message) ? root.message : {};
   const out: OpenAIChunk[] = [];
+
+  // Thinking models stream `message.thinking` alongside (and before) the
+  // visible content; normalize it to a `reasoning_content` delta so the
+  // Anthropic bridge emits `thinking_delta` events for it.
+  const thinking = asString(message.thinking) ?? "";
+  if (thinking) {
+    out.push({ model: state.model, choices: [{ index: 0, delta: { reasoning_content: thinking } }] });
+  }
 
   const text = asString(message.content) ?? "";
   if (text) out.push({ model: state.model, choices: [{ index: 0, delta: { content: text } }] });
@@ -726,6 +780,20 @@ export function anthropicToGemini(
       const block = isRecord(rawBlock) ? rawBlock : {};
       if (block.type === "text") {
         parts.push({ text: asString(block.text) ?? "" });
+      } else if (block.type === "thinking" && role === "assistant") {
+        // Anthropic thinking blocks become Gemini `thought` parts so the
+        // model's reasoning survives across multi-turn tool loops. The
+        // Anthropic `signature` (extended thinking) rides along as the
+        // Gemini `thoughtSignature` when present. Thinking blocks in any
+        // other role are dropped: thought parts are model-generated.
+        // `cache_control` markers are Anthropic-only and are never copied.
+        const text = asString(block.thinking) ?? "";
+        if (text) {
+          const part: Record<string, unknown> = { text, thought: true };
+          const signature = asString(block.signature);
+          if (signature) part.thoughtSignature = signature;
+          parts.push(part);
+        }
       } else if (block.type === "image" && isRecord(block.source)) {
         parts.push({
           inlineData: {
@@ -844,9 +912,17 @@ export function geminiToOpenAIResponse(body: unknown, requestedModel: string): R
   const content = isRecord(first.content) ? first.content : {};
   const parts = Array.isArray(content.parts) ? content.parts : [];
   let text = "";
+  let thought = "";
   const toolCalls: Record<string, unknown>[] = [];
   for (const raw of parts) {
     const part = isRecord(raw) ? raw : {};
+    // Gemini marks model reasoning with `thought: true` on a part; carry
+    // it as `reasoning_content` so the Anthropic bridge maps it back to a
+    // `thinking` block instead of mixing it into the visible text.
+    if (part.thought === true && typeof part.text === "string") {
+      thought += part.text;
+      continue;
+    }
     if (typeof part.text === "string") text += part.text;
     if (isRecord(part.functionCall)) {
       const fn = part.functionCall;
@@ -868,6 +944,7 @@ export function geminiToOpenAIResponse(body: unknown, requestedModel: string): R
         message: {
           role: "assistant",
           content: text,
+          ...(thought.length > 0 ? { reasoning_content: thought } : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason:
@@ -902,6 +979,13 @@ export function geminiChunkToChunks(chunk: unknown, state: GeminiStreamState): O
   const out: OpenAIChunk[] = [];
   for (const raw of parts) {
     const part = isRecord(raw) ? raw : {};
+    // `thought: true` parts are model reasoning, not visible output: emit
+    // them as `reasoning_content` deltas so the Anthropic bridge turns
+    // them into `thinking_delta` events.
+    if (part.thought === true && typeof part.text === "string" && part.text) {
+      out.push({ model: state.model, choices: [{ index: 0, delta: { reasoning_content: part.text } }] });
+      continue;
+    }
     if (typeof part.text === "string" && part.text) {
       out.push({ model: state.model, choices: [{ index: 0, delta: { content: part.text } }] });
     }

@@ -6,6 +6,7 @@ export * from "./comparator";
 export * from "./report";
 export * from "./provider-types";
 export * from "./provider-tasks";
+export * from "./provider-tasks-desktop";
 export * from "./provider-executor";
 export * from "./provider-runner";
 export * from "./provider-report";

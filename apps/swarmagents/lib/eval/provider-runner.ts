@@ -78,7 +78,7 @@ export class ProviderEvalRunner {
     const runDir = await this.isolation.create(`${task.id}-${provider.providerId}`, trial);
     let runError: unknown;
     let metrics: ProviderRunMetrics | undefined;
-    let exit: Pick<ProviderTrialResult, "exitReason" | "exitDetail"> = {};
+    let exit: Pick<ProviderTrialResult, "exitReason" | "exitDetail" | "desktop"> = {};
     let grading: { passed: number; failed: number; total: number } | undefined;
 
     try {
@@ -94,6 +94,7 @@ export class ProviderEvalRunner {
       exit = {
         ...(result.exitReason ? { exitReason: result.exitReason } : {}),
         ...(result.exitDetail ? { exitDetail: result.exitDetail } : {}),
+        ...(result.desktop ? { desktop: result.desktop } : {}),
       };
       // 3b. When a VM driver is supplied, provision this trial into the VM
       //      and verify it ends in the solved state.

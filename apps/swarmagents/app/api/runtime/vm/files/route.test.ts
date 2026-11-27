@@ -330,3 +330,156 @@ test("a symlink that stays inside /workspace is still readable", async () => {
   assert.equal(res.status, 200);
   assert.equal((await json(res)).content, "real content");
 });
+
+// ---------------------------------------------------------------------------
+// recent=1: the workspace's recently-touched files
+// ---------------------------------------------------------------------------
+
+/** Push a file's fake mtime back so it falls outside a fresh window. */
+function ageFile(driver: FakeVmDriver, user: string, path: string, ageMs: number): void {
+  const vms = (driver as unknown as { vms: Map<string, { mtimes: Map<string, number> }> }).vms;
+  const vm = vms.get(user);
+  assert.ok(vm, `fake vm for ${user} exists`);
+  vm.mtimes.set(path, Date.now() - ageMs);
+}
+
+test("recent=1 lists files across nested directories, most recent first", async () => {
+  const vm = install();
+  const driver = vm.driver as FakeVmDriver;
+  await vm.writeFile("alice", "/workspace/notes.md", "# hi");
+  await vm.writeFile("alice", "/workspace/src/app.ts", "export const x = 1;\n");
+  await vm.writeFile("alice", "/workspace/src/lib/deep.json", "{}");
+  ageFile(driver, "alice", "/workspace/notes.md", 30_000);
+  ageFile(driver, "alice", "/workspace/src/app.ts", 20_000);
+  ageFile(driver, "alice", "/workspace/src/lib/deep.json", 1_000);
+
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  const body = await json(res);
+  assert.equal(body.kind, "recent");
+  assert.equal(body.path, "/workspace");
+  assert.deepEqual(body.files.map((f: any) => f.path), [
+    "/workspace/src/lib/deep.json",
+    "/workspace/src/app.ts",
+    "/workspace/notes.md",
+  ]);
+  const first = body.files[0];
+  assert.equal(first.name, "deep.json");
+  assert.equal(first.size, 2);
+  assert.equal(typeof first.modifiedAt, "number");
+  assert.equal(first.contentType, "application/json");
+});
+
+test("recent=1 excludes files older than the window", async () => {
+  const vm = install();
+  const driver = vm.driver as FakeVmDriver;
+  await vm.writeFile("alice", "/workspace/fresh.txt", "new");
+  await vm.writeFile("alice", "/workspace/stale.txt", "old");
+  ageFile(driver, "alice", "/workspace/stale.txt", 30 * 60_000);
+
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  const body = await json(res);
+  assert.deepEqual(body.files.map((f: any) => f.path), ["/workspace/fresh.txt"]);
+});
+
+test("recent=1 clamps windowMs and limit", async () => {
+  const vm = install();
+  const driver = vm.driver as FakeVmDriver;
+  await vm.writeFile("alice", "/workspace/a.txt", "a");
+  await vm.writeFile("alice", "/workspace/b.txt", "b");
+  ageFile(driver, "alice", "/workspace/a.txt", 10_000);
+
+  const capped = await GET(
+    request("/api/runtime/vm/files?path=/workspace&recent=1&windowMs=999999999&limit=1"),
+  );
+  assert.equal(capped.status, 200);
+  const cappedBody = await json(capped);
+  assert.equal(cappedBody.windowMs, 60 * 60_000);
+  assert.deepEqual(cappedBody.files.map((f: any) => f.path), ["/workspace/b.txt"]);
+
+  const defaulted = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal((await json(defaulted)).windowMs, 15 * 60_000);
+
+  const floor = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1&limit=0"));
+  assert.equal((await json(floor)).files.length, 1);
+});
+
+test("recent=1 rejects unauthenticated requests and bad paths", async () => {
+  // Live VM: a missing directory is only knowable (404) when the VM runs; a
+  // stopped VM answers "no recent files" without being woken (test below).
+  await install().ensure("alice");
+  const unauth = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1", null));
+  assert.equal(unauth.status, 401);
+
+  const missing = await GET(request("/api/runtime/vm/files?path=/workspace/nope&recent=1"));
+  assert.equal(missing.status, 404);
+
+  const traversal = await GET(
+    request(`/api/runtime/vm/files?path=${encodeURIComponent("/workspace/../etc")}&recent=1`),
+  );
+  assert.equal(traversal.status, 403);
+});
+
+test("recent=1 on a file path is a 400; users only see their own VM", async () => {
+  const vm = install();
+  await vm.writeFile("alice", "/workspace/a.txt", "a");
+  await vm.writeFile("bob", "/workspace/b.txt", "b");
+
+  const fileRes = await GET(request("/api/runtime/vm/files?path=/workspace/a.txt&recent=1"));
+  assert.equal(fileRes.status, 400);
+
+  const bobRes = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1", "bob"));
+  assert.equal(bobRes.status, 200);
+  const bobBody = await json(bobRes);
+  assert.deepEqual(bobBody.files.map((f: any) => f.path), ["/workspace/b.txt"]);
+});
+
+// recent=1 fast path (review follow-up for #321): one in-VM find per poll,
+// no per-directory listDir walk, and a poll never resurrects a stopped VM.
+class FindDriver extends FakeVmDriver {
+  listDirCalls = 0;
+  findCalls = 0;
+  override async listDir(...args: Parameters<FakeVmDriver["listDir"]>) {
+    this.listDirCalls += 1;
+    return super.listDir(...args);
+  }
+  override async exec(...args: Parameters<FakeVmDriver["exec"]>) {
+    const [handle, cmd, opts] = args;
+    if (cmd[0] === "find") {
+      this.findCalls += 1;
+      const t = (Date.now() - 2_000) / 1000;
+      opts?.onStdout?.(`${t.toFixed(6)}\t5\t/workspace/report.csv\n${t.toFixed(6)}\t9\t/workspace/src/app.ts\n`);
+      return { exitCode: 0 };
+    }
+    return super.exec(handle, cmd, opts);
+  }
+}
+
+test("recent=1 uses ONE find exec and no listDir walk", async () => {
+  const driver = new FindDriver();
+  const manager = new VmManager({ customDriver: driver });
+  setVmManagerForTesting(manager);
+  await manager.ensure("alice");
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  const body = await json(res);
+  assert.deepEqual(body.files.map((f: any) => f.path).sort(), ["/workspace/report.csv", "/workspace/src/app.ts"]);
+  assert.equal(driver.findCalls, 1);
+  assert.equal(driver.listDirCalls, 0, "the per-directory walk is not used when find works");
+});
+
+test("recent=1 on a stopped VM returns no files and does not wake it", async () => {
+  const driver = new FindDriver();
+  const manager = new VmManager({ customDriver: driver });
+  setVmManagerForTesting(manager);
+  await manager.ensure("alice");
+  await manager.stop("alice");
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  assert.deepEqual((await json(res)).files, []);
+  assert.equal(driver.findCalls, 0);
+  assert.equal(driver.listDirCalls, 0);
+  const status = await manager.status("alice");
+  assert.notEqual(status, "running", "a recent-files poll must not resurrect the VM");
+});

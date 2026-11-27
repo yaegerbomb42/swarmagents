@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   EFFECT_HINT,
   HintCounter,
@@ -87,15 +88,19 @@ test("captureFingerprint uses the injected runner and survives runner errors", a
 const haveX = ["Xvfb", "scrot", "convert", "xdotool", "xterm"].every((b) => spawnSync("which", [b]).status === 0);
 
 test("real Xvfb: static screen is stable, typing into xterm is a change, clicking empty root is not", { skip: !haveX && "needs Xvfb, scrot, imagemagick, xdotool, xterm", timeout: 30_000 }, async () => {
-  const display = `:${90 + Math.floor(Math.random() * 9)}`;
+  // A free display from a wide range: parallel test files and live evals also
+  // start Xvfb servers, and a collision would silently point us at theirs.
+  let n = 0;
+  for (let i = 0; i < 50 && (!n || existsSync(`/tmp/.X${n}-lock`)); i++) n = 300 + Math.floor(Math.random() * 600);
+  const display = `:${n}`;
   const prevDisplay = process.env.DISPLAY;
   const procs: ChildProcess[] = [];
   try {
     procs.push(spawn("Xvfb", [display, "-screen", "0", "800x600x24", "-nolisten", "tcp"], { stdio: "ignore" }));
     process.env.DISPLAY = display;
-    for (let i = 0; i < 50 && spawnSync("xdotool", ["getmouselocation"]).status !== 0; i++) await new Promise((r) => setTimeout(r, 100));
+    for (let i = 0; i < 50 && spawnSync("xdotool", ["getmouselocation"], { timeout: 2_000 }).status !== 0; i++) await new Promise((r) => setTimeout(r, 100));
     procs.push(spawn("xterm", ["-geometry", "60x15+0+0"], { stdio: "ignore", env: { ...process.env } }));
-    for (let i = 0; i < 50 && spawnSync("xdotool", ["search", "--class", "xterm"]).status !== 0; i++) await new Promise((r) => setTimeout(r, 100));
+    for (let i = 0; i < 50 && spawnSync("xdotool", ["search", "--class", "xterm"], { timeout: 2_000 }).status !== 0; i++) await new Promise((r) => setTimeout(r, 100));
     await new Promise((r) => setTimeout(r, 800));
     spawnSync("xdotool", ["search", "--class", "xterm", "windowfocus"]);
     await new Promise((r) => setTimeout(r, 300));

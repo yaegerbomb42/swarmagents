@@ -14,7 +14,11 @@
  *   - a floating HUD chip, bottom-left of the frame, naming the action
  *     ("Clicking (640, 420)", "Typing…") — for every kind, including the
  *     ones with no screen target (type, navigate, screenshot, scroll,
- *     keypress).
+ *     keypress). The chip also carries the action effect (core-35): an
+ *     amber "no change" warning when the tool reported no visible change,
+ *     a "focus → <title>" suffix when focus moved, and a "Loop caught"
+ *     flash when the harness nudged the agent off a repeated no-op
+ *     (watchdog.loop).
  *
  * The whole layer is `pointer-events-none` and `aria-hidden`: it can never
  * intercept a human takeover click, and it is decorative — the same action
@@ -23,6 +27,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { cn } from "../utils/cn";
 import {
   computerActionLabel,
   DESKTOP_FRAMEBUFFER,
@@ -33,15 +38,29 @@ import {
 export const COMPUTER_ACTION_FRESH_MS = 5_000;
 /** How long the chip lingers after the action (the ripple itself is ~900ms). */
 export const COMPUTER_ACTION_LINGER_MS = 4_000;
+/** How long a watchdog.loop nudge flashes on the chip. */
+export const COMPUTER_LOOP_FLASH_MS = 4_000;
 
 function isFresh(action: ComputerAction | undefined, now = Date.now()): boolean {
   return !!action && now - action.at < COMPUTER_ACTION_FRESH_MS;
 }
 
-export function ComputerActionOverlay({ action }: { action?: ComputerAction }) {
+function isFreshLoop(loopNudgeAt: number | undefined, now = Date.now()): boolean {
+  return loopNudgeAt !== undefined && now - loopNudgeAt < COMPUTER_LOOP_FLASH_MS;
+}
+
+export function ComputerActionOverlay({
+  action,
+  loopNudgeAt,
+}: {
+  action?: ComputerAction;
+  /** Epoch ms of the newest watchdog.loop nudge; flashes the chip (core-21). */
+  loopNudgeAt?: number;
+}) {
   // Synchronous initial state so server/static renders show a fresh action
   // (effects do not run there); the timer below only hides it afterwards.
   const [visible, setVisible] = useState(() => isFresh(action));
+  const [loopFlash, setLoopFlash] = useState(() => isFreshLoop(loopNudgeAt));
 
   useEffect(() => {
     if (!action || !isFresh(action)) {
@@ -54,19 +73,36 @@ export function ComputerActionOverlay({ action }: { action?: ComputerAction }) {
     return () => clearTimeout(timer);
   }, [action]);
 
-  if (!action || !visible) return null;
+  useEffect(() => {
+    if (!isFreshLoop(loopNudgeAt)) {
+      setLoopFlash(false);
+      return;
+    }
+    setLoopFlash(true);
+    const linger = Math.max(0, COMPUTER_LOOP_FLASH_MS - (Date.now() - loopNudgeAt!));
+    const timer = setTimeout(() => setLoopFlash(false), linger);
+    return () => clearTimeout(timer);
+  }, [loopNudgeAt]);
 
-  const framebuffer = action.framebuffer ?? DESKTOP_FRAMEBUFFER;
-  const hasPoint = action.x !== undefined && action.y !== undefined;
+  if ((!action || !visible) && !loopFlash) return null;
+
+  const showAction = !!action && visible;
+  const framebuffer = action?.framebuffer ?? DESKTOP_FRAMEBUFFER;
+  const hasPoint = showAction && action.x !== undefined && action.y !== undefined;
   const left = hasPoint ? `${(action.x! / framebuffer.width) * 100}%` : undefined;
   const top = hasPoint ? `${(action.y! / framebuffer.height) * 100}%` : undefined;
-  const isClick = action.kind === "click" || action.kind === "double_click";
+  const isClick =
+    showAction && (action.kind === "click" || action.kind === "double_click");
+
+  const effect = showAction ? action.effect : undefined;
+  const noChange = effect?.changed === false;
+  const focusTitle = effect?.focus;
 
   return (
     <div
       aria-hidden
       data-testid="computer-action-overlay"
-      data-action-kind={action.kind}
+      data-action-kind={action?.kind}
       className="pointer-events-none absolute inset-0 z-[6]"
     >
       {hasPoint && (
@@ -115,13 +151,40 @@ export function ComputerActionOverlay({ action }: { action?: ComputerAction }) {
       )}
 
       <div
-        className="absolute bottom-3 left-3 flex items-center gap-1.5 rounded-full border border-white/[0.14] bg-zinc-950/70 px-2.5 py-1 font-mono text-[11px] text-white/90 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.14),0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur-xl"
+        className={cn(
+          "absolute bottom-3 left-3 flex items-center gap-1.5 rounded-full border border-white/[0.14] bg-zinc-950/70 px-2.5 py-1 font-mono text-[11px] text-white/90 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.14),0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur-xl",
+          loopFlash && "animate-pulse border-amber-400/50 text-amber-100",
+          noChange && "border-amber-400/40",
+        )}
         data-testid="computer-action-chip"
-        data-typing-badge={action.kind === "type" ? "true" : undefined}
+        data-typing-badge={showAction && action.kind === "type" ? "true" : undefined}
+        data-effect-changed={effect ? String(effect.changed) : undefined}
+        data-effect-focus={focusTitle}
+        data-loop-flash={loopFlash ? "true" : undefined}
       >
-        <span className="sa-reticle-pulse h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
+        <span
+          className={cn(
+            "sa-reticle-pulse h-1.5 w-1.5 shrink-0 rounded-full",
+            loopFlash || noChange ? "bg-amber-400" : "bg-sky-400",
+          )}
+        />
         <span className="text-white/50">A1</span>
-        {computerActionLabel(action)}
+        {showAction && computerActionLabel(action)}
+        {noChange && (
+          <span className="text-amber-300/90" data-testid="computer-action-effect">
+            no change
+          </span>
+        )}
+        {focusTitle && (
+          <span className="max-w-[160px] truncate text-white/60" data-testid="computer-action-effect">
+            focus → {focusTitle}
+          </span>
+        )}
+        {loopFlash && (
+          <span className="text-amber-200" data-testid="computer-action-loop">
+            Loop caught — agent nudged
+          </span>
+        )}
       </div>
     </div>
   );

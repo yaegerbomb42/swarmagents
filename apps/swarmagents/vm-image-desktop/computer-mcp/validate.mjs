@@ -356,13 +356,146 @@ function focusWindowArgs(args) {
 }
 
 /**
+ * Keysym spellings models reach for that X does not know (xdotool has no
+ * "Enter" keysym), mapped case-insensitively per combo part.
+ */
+const KEY_NAME_ALIASES = Object.freeze({
+  enter: "Return",
+  return: "Return",
+  esc: "Escape",
+  escape: "Escape",
+  backspace: "BackSpace",
+  del: "Delete",
+  delete: "Delete",
+  tab: "Tab",
+  space: "space",
+  spacebar: "space",
+  pageup: "Prior",
+  pagedown: "Next",
+  pgup: "Prior",
+  pgdn: "Next",
+  arrowup: "Up",
+  arrowdown: "Down",
+  arrowleft: "Left",
+  arrowright: "Right",
+  control: "ctrl",
+  cmd: "super",
+  win: "super",
+});
+
+/** Keys that run or discard a line typed at a terminal prompt (core-37). */
+export function clearsTerminalLine(combo) {
+  const c = String(combo ?? "");
+  return /(^|\+)(Return|KP_Enter)$/.test(c) || /^ctrl\+[uc]$/i.test(c);
+}
+
+/** "Enter" -> "Return", "Control+L" -> "ctrl+L", ["ctrl","l"] -> "ctrl+l". */
+export function normalizeKeyCombo(value) {
+  const raw = Array.isArray(value) ? value.filter((v) => typeof v === "string").join("+") : value;
+  if (typeof raw !== "string") return raw;
+  return raw
+    .trim()
+    .split(/\s*\+\s*/)
+    .map((part) => {
+      const alias = Object.prototype.hasOwnProperty.call(KEY_NAME_ALIASES, part.toLowerCase())
+        ? KEY_NAME_ALIASES[part.toLowerCase()]
+        : undefined;
+      return alias ?? part;
+    })
+    .join("+");
+}
+
+/** Everyday names for the open_app targets. */
+const OPEN_APP_ALIASES = Object.freeze({
+  shell: "terminal",
+  console: "terminal",
+  xterm: "terminal",
+  "xfce4-terminal": "terminal",
+  "terminal emulator": "terminal",
+  chrome: "browser",
+  chromium: "browser",
+  "web browser": "browser",
+  "file manager": "files",
+  thunar: "files",
+  writer: "libreoffice",
+  calc: "spreadsheet",
+});
+
+const firstDefined = (...values) => values.find((v) => v !== undefined && v !== null);
+
+/**
+ * Map the argument spellings models commonly use to the canonical ones
+ * (core-37), so a cheap model's `key {"key":"Enter"}` or `focus_window
+ * {"window_name":"beta"}` works instead of costing a turn or the task.
+ * Pure and idempotent; parseToolArgs calls it so the harness risk
+ * classifier and the server always agree on what a call means.
+ */
+export function normalizeToolArgs(tool, args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? { ...args } : {};
+  switch (tool) {
+    case "click":
+    case "double_click":
+    case "move":
+      // Anthropic computer-use style: coordinate: [x, y].
+      if (a.x === undefined && a.y === undefined && Array.isArray(a.coordinate) && a.coordinate.length === 2) {
+        [a.x, a.y] = a.coordinate;
+      }
+      delete a.coordinate;
+      break;
+    case "key":
+      a.combo = normalizeKeyCombo(firstDefined(a.combo, a.key, a.keys, a.keysym));
+      delete a.key;
+      delete a.keys;
+      delete a.keysym;
+      break;
+    case "type": {
+      const text = firstDefined(a.text, a.content, a.value);
+      const submit = firstDefined(a.submit, a.enter, a.press_enter) === true;
+      delete a.content;
+      delete a.value;
+      delete a.submit;
+      delete a.enter;
+      delete a.press_enter;
+      // A trailing newline is a Return press in both type modes.
+      a.text = submit && typeof text === "string" && !text.endsWith("\n") ? `${text}\n` : text;
+      break;
+    }
+    case "focus_window":
+      a.title = firstDefined(a.title, a.window_title, a.window_name, a.windowTitle, a.window, a.name);
+      delete a.window_title;
+      delete a.window_name;
+      delete a.windowTitle;
+      delete a.window;
+      delete a.name;
+      break;
+    case "open_app": {
+      const name = firstDefined(a.name, a.app, a.app_name, a.appName, a.application);
+      delete a.app;
+      delete a.app_name;
+      delete a.appName;
+      delete a.application;
+      if (typeof name === "string") {
+        const key = name.trim().toLowerCase();
+        a.name = Object.prototype.hasOwnProperty.call(OPEN_APP_ALIASES, key) ? OPEN_APP_ALIASES[key] : key;
+      } else {
+        a.name = name;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return a;
+}
+
+/**
  * Validate a tool call. Returns `{ ok: true, cmds: string[][] }` where each
  * command is a full argv array for the tool's program (xdotool for input
  * tools), or `{ ok: false, error }` with the reason. `screenshot` and `wait`
  * produce no commands (the server handles them directly).
  */
 export function parseToolArgs(tool, args) {
-  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const input = normalizeToolArgs(tool, args);
   switch (tool) {
     case "screenshot":
       return ok([]);
@@ -407,7 +540,7 @@ export function parseToolArgs(tool, args) {
 
 /** Short human-readable summary of a tool call (for telemetry / activity strip). */
 export function summarizeTool(tool, args) {
-  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const input = normalizeToolArgs(tool, args);
   const s = (v) => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
   switch (tool) {
     case "screenshot":

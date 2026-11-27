@@ -351,3 +351,169 @@ test("router state saves use unique temp names under same-millisecond concurrenc
     (fs as unknown as Record<string, unknown>).writeFileSync = realWriteFileSync;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Cross-format mid-run provider failover (core-06)
+// ---------------------------------------------------------------------------
+
+function streamResponse(frames: string[]): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        const enc = new TextEncoder();
+        for (const frame of frames) c.enqueue(enc.encode(frame));
+        c.close();
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+function openaiSse(chunks: unknown[]): Response {
+  return streamResponse([
+    ...chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`),
+    "data: [DONE]\n\n",
+  ]);
+}
+
+function geminiSse(chunks: unknown[]): Response {
+  return streamResponse(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`));
+}
+
+function anthropicSse(events: Array<{ event: string; data: unknown }>): Response {
+  return streamResponse(events.map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`));
+}
+
+const anthropicStartEvent = () => ({
+  event: "message_start",
+  data: {
+    type: "message_start",
+    message: {
+      id: "msg_1",
+      type: "message",
+      role: "assistant",
+      model: "claude-x",
+      content: [],
+      usage: { input_tokens: 6, output_tokens: 1 },
+    },
+  },
+});
+
+const anthropicDeltaEvent = (text: string) => ({
+  event: "content_block_delta",
+  data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+});
+
+test("cross-format streaming failover: Anthropic 429 -> OpenAI before the first token", async () => {
+  const u = owner();
+  const a = provider("a", { kind: "anthropic", apiStyle: "anthropic" });
+  const b = provider("b", { rank: 1 });
+  const { fetchImpl, calls } = stubFetch({
+    a: () => json({ error: { message: "rate limited" } }, 429),
+    b: () =>
+      openaiSse([
+        { id: "c1", model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "hello" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 6, completion_tokens: 2 } },
+      ]),
+  });
+  const t = memoryBus();
+  let out = "";
+  for await (const bytes of forwardLlmStreaming({ owner: u, providers: [a, b], body: { ...REQ, stream: true }, fetchImpl, runId: "run-xf", bus: t.bus })) {
+    out += new TextDecoder().decode(bytes);
+  }
+  // Not one byte of a's failed attempt reached the client: only b's provider
+  // comment, a valid Anthropic stream, and the translated text.
+  assert.match(out, /^: provider=b\n\n/);
+  assert.doesNotMatch(out, /: provider=a/);
+  assert.match(out, /message_start/);
+  assert.match(out, /"text":"hello"/);
+  assert.match(out, /end_turn/);
+  assert.deepEqual(calls.map((c) => c.host), ["a", "b"]);
+  const failovers = t.of("route.failover") as Array<{ from: { provider: string }; to: { provider: string }; reason: string }>;
+  assert.equal(failovers.length, 1);
+  assert.equal(failovers[0]!.from.provider, "a");
+  assert.equal(failovers[0]!.to.provider, "b");
+  const llmCalls = t.of("llm.call") as Array<{ provider: string; outcome: string; inputTokens?: number; outputTokens?: number }>;
+  assert.deepEqual(llmCalls.map((c) => `${c.provider}:${c.outcome}`), ["a:429", "b:ok"]);
+  assert.equal(llmCalls[1]!.inputTokens, 6);
+  assert.equal(llmCalls[1]!.outputTokens, 2);
+});
+
+test("cross-format streaming failover: OpenAI 5xx -> Gemini, stream translated", async () => {
+  const u = owner();
+  const a = provider("a");
+  const g = provider("g", { kind: "gemini", rank: 1 });
+  const { fetchImpl, calls } = stubFetch({
+    a: () => json({}, 500),
+    g: () =>
+      geminiSse([
+        {
+          candidates: [{ content: { parts: [{ text: "hello from gemini" }] } }],
+          usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 3 },
+        },
+      ]),
+  });
+  const t = memoryBus();
+  let out = "";
+  for await (const bytes of forwardLlmStreaming({ owner: u, providers: [a, g], body: { ...REQ, stream: true }, fetchImpl, runId: "run-xg", bus: t.bus })) {
+    out += new TextDecoder().decode(bytes);
+  }
+  assert.match(out, /^: provider=g\n\n/);
+  assert.doesNotMatch(out, /: provider=a/);
+  assert.match(out, /message_start/);
+  assert.match(out, /hello from gemini/);
+  assert.match(out, /end_turn/);
+  assert.deepEqual(calls.map((c) => c.host), ["a", "g"]);
+  const failovers = t.of("route.failover") as Array<{ from: { provider: string }; to: { provider: string } }>;
+  assert.equal(failovers.length, 1);
+  assert.equal(failovers[0]!.from.provider, "a");
+  assert.equal(failovers[0]!.to.provider, "g");
+  const llmCalls = t.of("llm.call") as Array<{ provider: string; outcome: string; inputTokens?: number; outputTokens?: number }>;
+  assert.deepEqual(llmCalls.map((c) => `${c.provider}:${c.outcome}`), ["a:5xx", "g:ok"]);
+  assert.equal(llmCalls[1]!.inputTokens, 7);
+  assert.equal(llmCalls[1]!.outputTokens, 3);
+});
+
+test("streaming: the sticky target pins at the confirmed first token, even if the stream dies", async () => {
+  const u = owner();
+  const a = provider("a", { kind: "anthropic", apiStyle: "anthropic" });
+  const b = provider("b", { rank: 1 });
+  const { fetchImpl } = stubFetch({
+    a: [
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              const enc = new TextEncoder();
+              c.enqueue(enc.encode(`event: message_start\ndata: ${JSON.stringify(anthropicStartEvent().data)}\n\n`));
+              c.enqueue(enc.encode(`event: content_block_delta\ndata: ${JSON.stringify(anthropicDeltaEvent("hi").data)}\n\n`));
+              // Die after the queued frames drain: both tokens reach the
+              // client before the stream errors.
+              setTimeout(() => c.error(new Error("mid-stream boom")), 5);
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      () => json(OK),
+    ],
+    b: () => json(OK),
+  });
+  const t = memoryBus();
+  let out = "";
+  for await (const bytes of forwardLlmStreaming({ owner: u, providers: [a, b], body: { ...REQ, stream: true }, fetchImpl, runId: "run-pin", bus: t.bus })) {
+    out += new TextDecoder().decode(bytes);
+  }
+  // a spoke (first token committed, so it owns the stream) then died mid-stream.
+  assert.match(out, /^: provider=a\n\n/);
+  assert.match(out, /"text":"hi"/);
+  assert.match(out, /event: error/);
+
+  // Second call of the same run: a is still the run's pinned sticky target
+  // even though its first attempt never completed — the pin happened at the
+  // confirmed first token, not at stream completion. (The router then weighs
+  // the recorded failure and may still steer away from a degraded sticky.)
+  await forwardLlmNonStreaming({ owner: u, providers: [a, b], body: REQ, fetchImpl, runId: "run-pin", bus: t.bus });
+  const decisions = t.of("route.decision") as Array<{ chosen: { provider: string; sticky: boolean }; failoverReason?: string }>;
+  const last = decisions.at(-1)!;
+  assert.match(String(last.failoverReason), /Sticky target a:a-model/);
+});

@@ -31,6 +31,14 @@ import { ClaudeCodeRunner } from "../harness/runner";
 import type { TelemetryEvent, VmExec, VmExecOpts } from "../harness/types";
 import { buildClaudeEnv } from "../providers/claude-env";
 import type { ProviderKind } from "../providers/types";
+import {
+  DESKTOP_ALLOWED_TOOLS,
+  DESKTOP_DENIED_TOOLS,
+  desktopMcpConfig,
+  foldDesktopTelemetry,
+  startDesktopSession,
+  type DesktopSession,
+} from "./desktop-session";
 import type {
   ProviderEvalTask,
   ProviderExecutor,
@@ -66,6 +74,11 @@ export interface LiveExecutorOptions {
   logDir?: string;
   /** Environment to read the key from (tests). Default process.env. */
   env?: Record<string, string | undefined>;
+  /**
+   * Desktop tasks: run computer-mcp in text-desktop mode (screenshot returns
+   * describe_screen text) for non-vision models.
+   */
+  textDesktop?: boolean;
 }
 
 /** Host env vars the agent process may inherit; everything else is dropped. HOME is replaced by the workspace. */
@@ -278,6 +291,15 @@ class TappedExec implements VmExec {
 }
 
 export function liveTaskPrompt(task: ProviderEvalTask, workspaceDir: string): string {
+  if (task.desktop) {
+    return [
+      task.prompt,
+      "",
+      "You are controlling a Linux desktop. You have NO shell or file tools: use only the computer-mcp tools " +
+        "(screenshot / describe_screen to see the screen, click, type, key, focus_window, open_app, ...). " +
+        `The working directory is ${workspaceDir}; relative paths mean paths inside it. Do not ask questions. When you are done, reply with one sentence.`,
+    ].join("\n");
+  }
   return [
     task.prompt,
     "",
@@ -307,6 +329,7 @@ export class LiveProviderExecutor implements ProviderExecutor {
       ? path.join(this.options.logDir, `${task.id}.${ctx.providerId}.t${ctx.trial ?? 1}.jsonl`.replace(/[^\w.-]/g, "_"))
       : undefined;
     let timedOut = false;
+    let desktop: DesktopSession | undefined;
     const abort = new AbortController();
     const timer = setTimeout(() => {
       timedOut = true;
@@ -317,9 +340,28 @@ export class LiveProviderExecutor implements ProviderExecutor {
     try {
       // Headless permissions: the agent may use the core tools without an
       // approval prompt, inside its throwaway config dir.
+      // Desktop tasks: GUI only. computer-mcp is the sole allowed surface and
+      // shell/file tools are denied outright, so a pass means the agent drove
+      // the desktop, not a shell.
+      let rolePhase: { roleId: string; allowedTools: string[]; mcpConfigPath: string } | undefined;
+      if (task.desktop) {
+        desktop = await startDesktopSession(task.desktop, workspaceDir);
+        const mcpConfigPath = path.join(configDir, "desktop-mcp.json");
+        await writeFile(
+          mcpConfigPath,
+          JSON.stringify(desktopMcpConfig(desktop.display, { textDesktop: this.options.textDesktop === true }), null, 2),
+        );
+        rolePhase = { roleId: "eval-desktop", allowedTools: DESKTOP_ALLOWED_TOOLS, mcpConfigPath };
+      }
       await writeFile(
         path.join(configDir, "settings.json"),
-        JSON.stringify({ permissions: { allow: ALLOWED_TOOLS, defaultMode: "acceptEdits" } }, null, 2),
+        JSON.stringify(
+          task.desktop
+            ? { permissions: { allow: DESKTOP_ALLOWED_TOOLS, deny: DESKTOP_DENIED_TOOLS, defaultMode: "default" } }
+            : { permissions: { allow: ALLOWED_TOOLS, defaultMode: "acceptEdits" } },
+          null,
+          2,
+        ),
       );
       const { env, secrets } = buildLiveEnv(this.options, ctx.model, configDir, workspaceDir);
       if (logFile) await mkdir(path.dirname(logFile), { recursive: true });
@@ -338,6 +380,7 @@ export class LiveProviderExecutor implements ProviderExecutor {
             vm: new TappedExec(new LocalProcessExec(), (chunk) => tap.push(chunk)),
             cwd: workspaceDir,
             signal: abort.signal,
+            ...(rolePhase ? { rolePhase } : {}),
           },
           (event) => {
             events.push(event);
@@ -376,9 +419,11 @@ export class LiveProviderExecutor implements ProviderExecutor {
         },
         exitReason,
         ...(detail ? { exitDetail: redactAll(detail, this.knownSecrets()).slice(0, 300) } : {}),
+        ...(task.desktop ? { desktop: foldDesktopTelemetry(events as Array<{ type: string }>) } : {}),
       };
     } finally {
       clearTimeout(timer);
+      await desktop?.stop();
       await rm(configDir, { recursive: true, force: true });
     }
   }

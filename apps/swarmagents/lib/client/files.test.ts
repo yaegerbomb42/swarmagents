@@ -4,6 +4,7 @@ import {
   FileBrowserError,
   WORKSPACE_ROOT,
   describeFilesError,
+  fetchRecentWorkspaceFiles,
   fetchWorkspaceFile,
   fetchWorkspaceListing,
   formatBytes,
@@ -204,4 +205,57 @@ test("formatBytes and describeFilesError produce friendly text", () => {
   assert.equal(describeFilesError(new FileBrowserError("not_found", "Missing.")), "Missing.");
   assert.equal(describeFilesError(new Error("boom")), "boom");
   assert.equal(describeFilesError("weird"), "Could not load the VM filesystem.");
+});
+
+test("fetchRecentWorkspaceFiles builds the recent=1 URL and parses files", async () => {
+  let seen = "";
+  const fetchImpl: FetchLike = async (input) => {
+    seen = String(input);
+    return new Response(
+      JSON.stringify({
+        path: "/workspace",
+        kind: "recent",
+        since: 1000,
+        windowMs: 900_000,
+        files: [
+          { name: "app.ts", path: "/workspace/src/app.ts", size: 12, modifiedAt: 2000, contentType: "text/typescript" },
+        ],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const recent = await fetchRecentWorkspaceFiles({ limit: 8, fetchImpl });
+  assert.match(seen, /recent=1/);
+  assert.match(seen, /limit=8/);
+  assert.equal(recent.kind, "recent");
+  assert.equal(recent.windowMs, 900_000);
+  assert.equal(recent.files[0].path, "/workspace/src/app.ts");
+  assert.equal(recent.files[0].contentType, "text/typescript");
+});
+
+test("fetchRecentWorkspaceFiles maps errors and malformed payloads", async () => {
+  await assert.rejects(
+    fetchRecentWorkspaceFiles({
+      fetchImpl: fakeFetch({ error: "Sign in required.", code: "unauthorized" }, { status: 401 }),
+    }),
+    (err: unknown) => err instanceof FileBrowserError && err.kind === "unauthorized",
+  );
+  await assert.rejects(
+    fetchRecentWorkspaceFiles({ fetchImpl: fakeFetch({ kind: "directory", files: [] }) }),
+    (err: unknown) => err instanceof FileBrowserError && err.kind === "malformed",
+  );
+  await assert.rejects(
+    fetchRecentWorkspaceFiles({
+      fetchImpl: fakeFetch({ kind: "recent", files: [{ name: "x", path: "/workspace/x" }] }),
+    }),
+    (err: unknown) => err instanceof FileBrowserError && err.kind === "malformed",
+  );
+  const fetchImpl: FetchLike = async () => {
+    throw new TypeError("fetch failed");
+  };
+  await assert.rejects(
+    fetchRecentWorkspaceFiles({ fetchImpl }),
+    (err: unknown) => err instanceof FileBrowserError && err.kind === "network",
+  );
 });

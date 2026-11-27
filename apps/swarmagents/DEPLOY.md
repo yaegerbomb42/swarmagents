@@ -577,6 +577,30 @@ CPU and PID ceilings stay as configured (`SWARM_VM_CPUS` default `2`,
 concurrent desktop VMs × their ceiling — a single 4GiB desktop VM is roughly
 the footprint of one heavy user machine.
 
+### Warm VM pool (`SWARM_VM_WARM_POOL_SIZE`)
+
+> **Not active in production yet.** Only the fake (test) driver implements the
+> warm-pool capability. With the docker driver the setting is ignored and the
+> app logs `[vm] SWARM_VM_WARM_POOL_SIZE=… is ignored` once at boot; leave it
+> unset on the VPS until the docker driver gains prewarm/adoptWarm.
+
+Cold-starting a desktop VM (Docker + Xvnc + XFCE + Chromium) takes several
+seconds per new user. `SWARM_VM_WARM_POOL_SIZE` (default `0` = off) keeps a
+bounded pool of pre-booted, unassigned VMs so a user's first `ensure()`
+hands them a running container instead. After each hand-off the pool
+replenishes asynchronously back to the bound.
+
+Isolation is strict: at hand-off the VM gets a fresh `/workspace` volume
+and a fresh VNC password before the user's first exec — no warm-phase
+state can ever leak between users. A pool slot counts against host sizing
+exactly like an active desktop VM (memory × pool size on top of concurrent
+users), so size it deliberately — e.g. `SWARM_VM_WARM_POOL_SIZE=2` for a
+small deployment that wants snappy first runs without doubling the RAM
+ceiling. The pool engages only when the driver implements the
+prewarm/adoptWarm capability (today: the fake driver, so tests prove the
+contract); the docker and BYOC drivers cold-boot as before until they gain
+the capability.
+
 ### VM network (`SWARM_VM_NETWORK`)
 
 By default, VM containers are created on Docker's default bridge — the same

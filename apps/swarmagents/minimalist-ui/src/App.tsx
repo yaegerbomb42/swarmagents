@@ -22,13 +22,16 @@ import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
-import { deriveComputerAction, derivePresence } from "../../lib/client/presence";
+import { deriveComputerAction, derivePresence, lastLoopNudgeAt } from "../../lib/client/presence";
+import { reduceServingModel, formatServingModel } from "../../lib/client/servingModel";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm, type RunTier } from "../../lib/client/runs";
+import { fetchSchedules, unreadScheduledRuns, type ScheduleSummary } from "../../lib/client/schedules";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
 import { devModeFromSearch, resolveView } from "./devMode";
+import { forkPromptFromSearch } from "./fork-prompt";
 import { firstRunSetup, useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
 import { cn } from "./utils/cn";
 import { ApprovalGate } from "./components/ApprovalGate";
@@ -164,6 +167,17 @@ export default function App() {
   // linking reads it even while the view is hidden.
   const effectiveView = resolveView(view, devMode);
   const [draft, setDraft] = useSessionPersisted<string>("sa.draft", "");
+  // A share link's "Try this prompt" lands here with ?prompt=<text>: fill
+  // the composer once, then strip the parameter so a refresh keeps the
+  // visitor's own edits instead of re-injecting the forked prompt.
+  useEffect(() => {
+    const forked = forkPromptFromSearch(window.location.search);
+    if (forked === null) return;
+    setDraft(forked);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("prompt");
+    window.history.replaceState(null, "", url);
+  }, [setDraft]);
   const observedActiveRuns = useRef(new Set<string>());
   const notifiedRuns = useRef(new Set<string>());
 
@@ -173,6 +187,50 @@ export default function App() {
   const board = useBoard(view === "board");
 
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [schedules, setSchedules] = useState<ScheduleSummary[]>([]);
+  const [seenScheduleRunIds, setSeenScheduleRunIds] = usePersisted<string[]>("sa.seenScheduleRunIds", []);
+  // First time this browser tracks cron runs, start the unread clock now so
+  // existing schedules' past runs are not all flagged unread.
+  const [cronRunsSince, setCronRunsSince] = usePersisted<number>("sa.cronRunsSince", 0);
+  useEffect(() => {
+    if (!cronRunsSince) setCronRunsSince(Date.now());
+  }, [cronRunsSince, setCronRunsSince]);
+  const unreadCronRuns = useMemo(
+    () => unreadScheduledRuns(schedules, seenScheduleRunIds, cronRunsSince || Number.POSITIVE_INFINITY),
+    [schedules, seenScheduleRunIds, cronRunsSince],
+  );
+  useEffect(() => {
+    if (session.signedOut) {
+      setSchedules([]);
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    const load = async () => {
+      const res = await fetchSchedules(fetch, controller.signal);
+      if (!cancelled && res.ok) setSchedules(res.schedules);
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 30_000);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [session.signedOut]);
+  const markAllCronRunsRead = useCallback(() => {
+    const ids = unreadCronRuns.map((u) => u.runId);
+    if (ids.length === 0) return;
+    setSeenScheduleRunIds((prev) => Array.from(new Set([...prev, ...ids])).slice(-200));
+  }, [unreadCronRuns, setSeenScheduleRunIds]);
+  const jumpToCronRun = useCallback(
+    (runId: string) => {
+      setSeenScheduleRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId].slice(-200)));
+      session.selectThread(runId);
+      setView("chat");
+    },
+    [session, setSeenScheduleRunIds, setView],
+  );
   const [settings, setSettings] = useState<{ open: boolean; tab: SettingsTab }>({ open: false, tab: "providers" });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [focusTaskId, setFocusTaskId] = useState<string>();
@@ -212,6 +270,7 @@ export default function App() {
   const { phase, busy, headRun, activeRun } = session;
   const phaseMeta = phase ? RUN_PHASE_META[phase] : undefined;
   const activitySuffix = workspaceActivitySuffix(session.activity, phaseMeta?.active, vmDisplay.label);
+  const servingModelLabel = useMemo(() => formatServingModel(reduceServingModel(session.liveItems)), [session.liveItems]);
   const needsAttention =
     phase === "approval" || phase === "question" || phase === "paused" || phase === "error" || vmDisplay.state === "error";
 
@@ -246,6 +305,12 @@ export default function App() {
   // stream (the screen falls back to its own derivation when this is absent).
   const screenComputerAction = useMemo(
     () => deriveComputerAction(session.liveItems),
+    [session.liveItems],
+  );
+
+  // The newest loop nudge, for the overlay's "Loop caught" chip flash.
+  const screenLoopNudgeAt = useMemo(
+    () => lastLoopNudgeAt(session.liveItems),
     [session.liveItems],
   );
 
@@ -526,6 +591,7 @@ export default function App() {
           since: headRun?.createdAt,
           durationMs: headDuration,
           activity: session.activity,
+          servingModel: servingModelLabel,
           stopping,
           onStop: () => void handleStop(),
           onShow: showRun,
@@ -535,6 +601,7 @@ export default function App() {
         onOpenShortcuts={() => setShortcutsOpen(true)}
         user={me}
         alwaysOn247={alwaysOn247}
+        unreadCronCount={unreadCronRuns.length}
       />
 
       {session.offline && !session.signedOut && (
@@ -651,6 +718,7 @@ export default function App() {
               fitToHeight={wide}
               presence={screenPresence}
               computerAction={screenComputerAction}
+              loopNudgeAt={screenLoopNudgeAt}
               activity={session.activity ? [{ text: session.activity }] : undefined}
               className={wide ? "h-full" : undefined}
             />
@@ -761,6 +829,9 @@ export default function App() {
         onNewChat={handleNewChat}
         newChatDisabled={busy}
         onRetry={session.refresh}
+        unreadCronRuns={unreadCronRuns}
+        onJumpToCronRun={jumpToCronRun}
+        onMarkCronRunsRead={markAllCronRunsRead}
       />
 
       {/* Slide-over Settings & Multi-Provider Sheet */}

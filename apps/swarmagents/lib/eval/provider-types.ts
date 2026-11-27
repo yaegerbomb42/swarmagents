@@ -14,13 +14,16 @@
 // against the real runtime (see provider-executor.ts) for local Docker VM
 // runs.
 
+import type { DesktopRunMetrics, DesktopSetup } from "./desktop-session";
+
 export type ProviderTaskCategory =
   | "coding"
   | "web"
   | "file-org"
   | "gui-app"
   | "non-vision-desktop"
-  | "data";
+  | "data"
+  | "desktop";
 
 /**
  * One scripted general task. The starting workspace is materialised into an
@@ -32,6 +35,12 @@ export interface ProviderEvalTask {
   category: ProviderTaskCategory;
   /** "hard" tasks are the discriminative set (provider-tasks-hard.ts). */
   difficulty?: "standard" | "hard";
+  /**
+   * Live desktop task (core-36): the live executor boots an Xvfb display with
+   * these windows and the agent may ONLY use computer-mcp (no shell or file
+   * tools), so the result measures GUI control. Never in the default set.
+   */
+  desktop?: DesktopSetup;
   title: string;
   description: string;
   /** The user request handed to the agent. */
@@ -72,6 +81,8 @@ export interface ProviderExecutorResult {
   exitReason?: ProviderRunExitReason;
   /** Short, redacted explanation for an "error" exit. */
   exitDetail?: string;
+  /** Desktop tasks: computer actions, no-change effects, loop nudges. */
+  desktop?: DesktopRunMetrics;
 }
 
 export interface ProviderRunContext {
@@ -106,6 +117,7 @@ export interface ProviderTrialResult {
   mode?: ProviderRunMode;
   exitReason?: ProviderRunExitReason;
   exitDetail?: string;
+  desktop?: DesktopRunMetrics;
 }
 
 export interface ProviderReportRow {

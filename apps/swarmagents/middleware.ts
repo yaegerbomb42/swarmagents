@@ -249,14 +249,16 @@ export function middleware(req: NextRequest) {
     // internal host and port, and middleware rejects relative Locations.
     return withSecurityHeaders(NextResponse.redirect(`${redirectOrigin(req)}/login?next=${encodeURIComponent(pathname + search)}`, 303), nonce, headerOpts, rate);
   }
-  // Local mode: one canonical origin (127.0.0.1) so localStorage and the OAuth callback don't split across
-  // localhost/127.0.0.1. Document navigations only; API/fetch/SSE on localhost keep working.
-  const host = (req.headers.get("host") ?? "").split(":")[0];
-  if (!serverMode() && host === "localhost" && req.headers.get("sec-fetch-mode") === "navigate") {
-    const u = new URL(req.url);
-    u.hostname = "127.0.0.1";
-    return withSecurityHeaders(NextResponse.redirect(u, 308), nonce, headerOpts, rate);
-  }
+  // Local mode used to 308-redirect localhost document navigations to
+  // 127.0.0.1 here (one canonical origin, so localStorage and the OAuth
+  // callback never split across the two). That redirect can never work:
+  // Next.js relativizes middleware redirects against the request's internal
+  // URL — the server binds 0.0.0.0, so the redirect target (127.0.0.1) IS
+  // the internal origin — and collapses it to a bare "/" that the browser
+  // resolves against localhost, looping forever (morning-01 audit: every
+  // browser navigation to http://localhost:<port>/ 308'd to itself).
+  // Canonicalization now happens client-side in app/layout.tsx, before React
+  // mounts, so localhost still lands on 127.0.0.1 and the page loads.
   return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, headerOpts, rate);
 }
 

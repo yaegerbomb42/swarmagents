@@ -35,9 +35,24 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
   // stale nonce can never be served from a static cache. The nonce is intentionally
   // NOT mirrored onto <body data-nonce> to avoid re-exposing it to attribute selectors
   // and client scripts reading document.body.dataset.nonce.
-  await headers();
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
   return (
     <html lang="en">
+      <head>
+        {/* Local-mode canonical origin: move localhost document loads to
+            127.0.0.1 before React mounts, so localStorage and the OAuth
+            callback never split across the two. The middleware cannot do
+            this with a redirect (see middleware.ts: Next.js relativizes
+            it to "/" and loops). Fires only on localhost; a no-op on the
+            deployed site and on 127.0.0.1. If the nonce is ever absent the
+            CSP blocks this script and the page simply stays on localhost. */}
+        <script
+          nonce={nonce}
+          dangerouslySetInnerHTML={{
+            __html: `if (window.location.hostname === "localhost") { window.location.replace(window.location.href.replace("://localhost", "://127.0.0.1")); }`,
+          }}
+        />
+      </head>
       <body>{children}</body>
     </html>
   );

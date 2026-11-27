@@ -1150,11 +1150,8 @@ export class ClaudeCodeRunner {
         try {
           handleLine(raw);
         } catch (error) {
-          if (haltedReason === null) {
-            const message = error instanceof Error ? error.message : String(error);
-            emit({ type: "run.error", message: redact(message), sessionId: lastSessionId });
-            halt("internal harness error");
-          }
+          const message = error instanceof Error ? error.message : String(error);
+          halt(`internal harness error: ${redact(message)}`);
         }
       },
       onMalformed: () => {

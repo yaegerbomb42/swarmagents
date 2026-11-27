@@ -19,9 +19,11 @@ import { uid } from "../data";
 import type { RunTier } from "../../../lib/client/runs";
 import { validateAttachment } from "../../../lib/client/upload";
 import { cn } from "../utils/cn";
-import { IconButton, Notice } from "./ui";
+import { Button, IconButton, Notice } from "./ui";
 
-export type ComposerSendResult = { ok: true } | { ok: false; error: string };
+export type ComposerSendResult =
+  | { ok: true }
+  | { ok: false; error: string; status?: number };
 
 export interface ComposerProps {
   /** The draft. The workspace owns it so it survives view changes and reloads. */
@@ -150,6 +152,11 @@ export function Composer({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string>();
+  // A failed send that is worth trying again (429/503, or the network): the
+  // draft comes back, so Retry resends exactly what failed. A 401 is not
+  // retryable — the workspace shows the sign-in notice instead.
+  const [retryable, setRetryable] = useState(false);
+  const lastSendStatusRef = useRef<number | undefined>(undefined);
   const [dragging, setDragging] = useState(false);
   const ownRef = useRef<HTMLTextAreaElement | null>(null);
   const textRef = inputRef ?? ownRef;
@@ -197,13 +204,25 @@ export function Composer({
   const blocked = Boolean(blockedReason);
   const sendable = canSend({ text: draft, attachments: attachments.length, sending, blocked });
 
+  // Remember the last send's HTTP status so the error notice knows whether
+  // a Retry button makes sense; sendDraft itself only reports success.
+  const sendCapturing = useCallback(
+    async (text: string, files: Attachment[]): Promise<ComposerSendResult> => {
+      const result = await onSend(text, files);
+      lastSendStatusRef.current = result.ok ? undefined : result.status;
+      return result;
+    },
+    [onSend],
+  );
+
   const submit = useCallback(async () => {
     if (!canSend({ text: draft, attachments: attachments.length, sending, blocked })) return;
     const files = attachments;
+    setRetryable(false);
     const sent = await sendDraft(
       { text: draft, files },
       {
-        onSend,
+        onSend: sendCapturing,
         setText: setDraft,
         setFiles: (next) => {
           attachmentsRef.current = next;
@@ -213,9 +232,10 @@ export function Composer({
         setSending,
       },
     );
+    if (!sent) setRetryable(lastSendStatusRef.current !== 401);
     if (sent) release(files);
     textRef.current?.focus();
-  }, [draft, attachments, sending, blocked, onSend, setDraft, textRef]);
+  }, [draft, attachments, sending, blocked, sendCapturing, setDraft, textRef]);
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     const action = composerKeyAction({
@@ -254,7 +274,19 @@ export function Composer({
   return (
     <div className={cn("w-full", className)} data-testid="composer">
       {error && (
-        <Notice tone="err" title="That did not send" className="sa-enter mb-2" testId="composer-error">
+        <Notice
+          tone="err"
+          title="That did not send"
+          className="sa-enter mb-2"
+          testId="composer-error"
+          action={
+            retryable ? (
+              <Button size="sm" onClick={() => void submit()} data-testid="composer-retry">
+                Retry
+              </Button>
+            ) : undefined
+          }
+        >
           {error}
         </Notice>
       )}
@@ -336,7 +368,10 @@ export function Composer({
               value={draft}
               onChange={(event) => {
                 setDraft(event.target.value);
-                if (error) setError(undefined);
+                if (error) {
+                  setError(undefined);
+                  setRetryable(false);
+                }
               }}
               onKeyDown={onKeyDown}
               onPaste={onPaste}

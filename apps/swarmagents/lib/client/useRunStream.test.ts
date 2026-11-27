@@ -1,6 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getRunStreamBadge, isTerminalRunEvent, shouldResetStreamCursor, clearSseCursor, readSseCursor, writeSseCursor, type RunStreamItem } from "./useRunStream.js";
+import {
+  backfillTruncatedItems,
+  getRunStreamBadge,
+  isTerminalRunEvent,
+  parseRunLogNdjson,
+  shouldResetStreamCursor,
+  snapshotTruncation,
+  RUN_ID_RE,
+  clearSseCursor,
+  readSseCursor,
+  writeSseCursor,
+  type RunStreamItem,
+} from "./useRunStream.js";
 
 function item(kind: string): RunStreamItem {
   return { seq: 1, kind, data: {}, parsed: { data: "{}" }, ts: Date.now() };
@@ -102,4 +114,98 @@ test("SSE cursor helpers tolerate missing or blocked storage", () => {
   writeSseCursor("run_a", "42"); // must not throw
   clearSseCursor("run_a"); // must not throw
   assert.equal(readSseCursor("run_a"), undefined);
+});
+
+test("RUN_ID_RE: only server-minted run ids may reach the stream URL", () => {
+  assert.equal(RUN_ID_RE.test("run_11111111-2222-3333-4444-555555555555"), true);
+  assert.equal(RUN_ID_RE.test("run_a"), true);
+  assert.equal(RUN_ID_RE.test('"><script>alert(1)</script>'), false);
+  assert.equal(RUN_ID_RE.test("run_../../etc/passwd"), false);
+  assert.equal(RUN_ID_RE.test(""), false);
+  assert.equal(RUN_ID_RE.test("a".repeat(65)), false);
+});
+
+test("snapshotTruncation: reads the first event id from a truncated snapshot", () => {
+  const snapshot = (data: unknown): RunStreamItem => ({
+    seq: 1,
+    kind: "run.snapshot",
+    data,
+    parsed: { data: "{}" },
+    ts: Date.now(),
+  });
+  assert.equal(snapshotTruncation([snapshot({ truncated: true, firstEventId: 1500, lastEventId: 3499 })]), 1500);
+  assert.equal(snapshotTruncation([snapshot({ truncated: false, firstEventId: 1 })]), null);
+  assert.equal(snapshotTruncation([snapshot({ truncated: true })]), null);
+  assert.equal(snapshotTruncation([item("assistant.text")]), null);
+  assert.equal(snapshotTruncation([]), null);
+});
+
+test("parseRunLogNdjson: parses persisted events, skips bad lines", () => {
+  const text = [
+    JSON.stringify({ seq: 1, runId: "r", ts: 100, type: "run.created", data: { a: 1 } }),
+    "not json",
+    JSON.stringify({ seq: 2, runId: "r", ts: 101, type: "assistant.text", data: "hi" }),
+    JSON.stringify({ runId: "r", type: "no-seq" }),
+    "",
+    JSON.stringify({ seq: 3, runId: "r", ts: 102, type: 42, data: null }),
+  ].join("\n");
+  const items = parseRunLogNdjson(text);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].kind, "run.created");
+  assert.equal(items[0].seq, 1);
+  assert.deepEqual(items[0].data, { a: 1 });
+  assert.equal(items[1].kind, "assistant.text");
+  assert.equal(items[1].parsed.id, "2");
+});
+
+test("backfillTruncatedItems: prepends the omitted head and drops the snapshot", () => {
+  const snapshot: RunStreamItem = {
+    seq: 1,
+    kind: "run.snapshot",
+    data: { truncated: true, firstEventId: 3, lastEventId: 4 },
+    parsed: { data: "{}" },
+    ts: 1,
+  };
+  const tail: RunStreamItem[] = [
+    { seq: 2, kind: "assistant.text", data: "c", parsed: { data: "{}" }, ts: 3 },
+    { seq: 3, kind: "assistant.text", data: "d", parsed: { data: "{}" }, ts: 4 },
+  ];
+  const logged: RunStreamItem[] = [
+    { seq: 1, kind: "run.created", data: {}, parsed: { data: "{}", id: "1" }, ts: 1 },
+    { seq: 2, kind: "assistant.text", data: "b", parsed: { data: "{}", id: "2" }, ts: 2 },
+    { seq: 3, kind: "assistant.text", data: "c", parsed: { data: "{}", id: "3" }, ts: 3 },
+  ];
+  const merged = backfillTruncatedItems([snapshot, ...tail], logged);
+  assert.ok(merged);
+  assert.equal(merged.complete, true);
+  assert.deepEqual(
+    merged.items.map((item) => item.kind),
+    ["run.created", "assistant.text", "assistant.text", "assistant.text"],
+  );
+  // Backfilled seqs sort before the replayed tail and stay unique.
+  const seqs = merged.items.map((item) => item.seq);
+  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
+  assert.equal(new Set(seqs).size, seqs.length);
+});
+
+test("backfillTruncatedItems: no-ops without a truncated snapshot or past the cap", () => {
+  const tail: RunStreamItem[] = [{ seq: 2, kind: "assistant.text", data: "c", parsed: { data: "{}" }, ts: 3 }];
+  assert.equal(backfillTruncatedItems(tail, tail), null);
+  const snapshot: RunStreamItem = {
+    seq: 1,
+    kind: "run.snapshot",
+    data: { truncated: true, firstEventId: 2, lastEventId: 2 },
+    parsed: { data: "{}" },
+    ts: 1,
+  };
+  const logged: RunStreamItem[] = [
+    { seq: 1, kind: "run.created", data: {}, parsed: { data: "{}", id: "1" }, ts: 1 },
+  ];
+  // A maxItems of 1 cannot hold the backfilled head plus the tail.
+  assert.equal(backfillTruncatedItems([snapshot, ...tail], logged, 1), null);
+  // Exactly at the cap, it fits and the snapshot is dropped.
+  const merged = backfillTruncatedItems([snapshot, ...tail], logged, 2);
+  assert.ok(merged);
+  assert.equal(merged.items.length, 2);
+  assert.ok(!merged.items.some((item) => item.kind === "run.snapshot"));
 });

@@ -36,6 +36,7 @@ import {
   type ThreadSummary,
 } from "../../../lib/client/thread";
 import { isTerminalRunEvent, useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
+import { useActiveRun, writeLastRunHint } from "../../../lib/client/useActiveRun";
 import { extractApprovals, pendingApprovals, type ApprovalEntry } from "../../../lib/client/runTimeline";
 import { buildConversation, splitUploadedFiles, type ConversationEntry } from "../../../lib/client/conversation";
 import { deriveRunPhase, isRunActive, type RunPhase } from "../../../lib/client/runPhase";
@@ -97,7 +98,9 @@ export interface PromptDisplay {
   attachments: string[];
 }
 
-export type SendResult = { ok: true; runId: string; queued: boolean } | { ok: false; error: string };
+export type SendResult =
+  | { ok: true; runId: string; queued: boolean }
+  | { ok: false; error: string; status?: number };
 
 export interface SendOptions {
   /** Shown in the conversation instead of the full prompt (e.g. a board task title). */
@@ -275,6 +278,22 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
   const [pending, setPending] = useState<PendingTurn>();
   const [dispatching, setDispatching] = useState(false);
   const [promptCache, setPromptCache] = usePersisted<Record<string, PromptDisplay>>("sa.prompts", {});
+  // The run to reattach to after a (re)load: the account's live run, else the
+  // most recent one that finished within 10 minutes. Fetched once on mount.
+  const activeRestore = useActiveRun();
+  // Applied once, on mount: opening the restored run's conversation is what
+  // makes a reload land on the live run instead of a stale thread. A run the
+  // user starts later in this visit never yanks the view away.
+  const restoreAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!activeRestore.ready || restoreAppliedRef.current) return;
+    const selection = activeRestore.selection;
+    if (!selection) return;
+    const target = selection.sessionId ?? selection.runId;
+    if (!target || target === threadKeyRef.current) return;
+    restoreAppliedRef.current = true;
+    setStoredKey(target);
+  }, [activeRestore.ready, activeRestore.selection, setStoredKey]);
   const [questions, setQuestions] = useState<OpenQuestion[]>([]);
   const [handoffs, setHandoffs] = useState<OpenHandoff[]>([]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -306,7 +325,10 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
   const activeInView = Boolean(activeRun && turns.some((turn) => turn.runId === activeRun.runId));
   const latestTurn = turns[turns.length - 1];
   const headRun = activeRun ?? latestTurn;
-  const liveRunId = headRun?.runId;
+  // Before the first poll answers there is no head run yet: attach the
+  // stream to the last run id from sessionStorage so a reload resumes mid-run
+  // instead of showing nothing until the poll lands.
+  const liveRunId = headRun?.runId ?? (!ready ? activeRestore.hintRunId : undefined);
 
   // ---- Live stream ----
 
@@ -537,11 +559,12 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
       setPending({ id: pendingId, ...display, ts: Date.now() });
       setDispatching(true);
       // A failed send never becomes a turn: the caller keeps the draft and
-      // shows the error where the user typed it.
-      const fail = (error: string): SendResult => {
+      // shows the error where the user typed it. The HTTP status rides along
+      // so the UI can tell "sign in" (401) from "try again" (429/503).
+      const fail = (error: string, status?: number): SendResult => {
         setPending((prev) => (prev?.id === pendingId ? undefined : prev));
         setDispatching(false);
-        return { ok: false, error };
+        return status === undefined ? { ok: false, error } : { ok: false, error, status };
       };
 
       let uploadedFiles: Array<{ path: string; size: number }> = [];
@@ -572,7 +595,17 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
       const fullPrompt = withUploadManifest(prompt, uploadedFiles);
       const { agentCard, fullAuto, computeTarget, tier } = optionsRef.current;
       const result = await startRun({ prompt: fullPrompt, sessionId, agentCard, fullAuto, computeTarget, tier });
-      if (!result.ok) return fail(result.error);
+      if (!result.ok) {
+        // A 401 means the session ended: surface the sign-in state (with its
+        // link) instead of the raw server error, and say so in the composer.
+        if (result.status === 401) {
+          setSignedOut(true);
+          return fail("Sign in to use your computer.", 401);
+        }
+        return fail(result.error, result.status);
+      }
+      // Remember this run so a reload can reattach to it before the first poll.
+      writeLastRunHint(result.runId);
 
       // Show the run at once; the next poll replaces this with the server's row.
       const started: ThreadRunInput = {

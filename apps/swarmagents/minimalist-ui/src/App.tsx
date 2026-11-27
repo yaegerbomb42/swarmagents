@@ -349,13 +349,21 @@ export default function App() {
     async (text: string, attachments: Attachment[]): Promise<ComposerSendResult> => {
       stopDuringSendRef.current = false;
       const result = await session.send(text, attachments);
+      if (!result.ok && (result.status === 429 || result.status === 503)) {
+        // The composer shows the same error inline with a Retry button; the
+        // toast makes sure it is seen even when the composer is scrolled away.
+        // Nothing pretends the run started: no simulated engine runs.
+        pushToast({ tone: "error", message: "The server could not start the run.", detail: result.error });
+      }
       // The screen opens automatically on wide screens when a run starts; on
       // a phone — or when the user already clicked Stop mid-request — stay put.
       if (result.ok && !result.queued && wide && !stopDuringSendRef.current) setView("screen");
       stopDuringSendRef.current = false;
-      return result.ok ? { ok: true } : { ok: false, error: result.error };
+      return result.ok
+        ? { ok: true }
+        : { ok: false, error: result.error, ...(result.status !== undefined ? { status: result.status } : {}) };
     },
-    [session, setView, wide],
+    [session, setView, wide, pushToast],
   );
 
   /**

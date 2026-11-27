@@ -21,8 +21,14 @@
 import { useEffect, useRef, useState } from "react";
 import { backoffDelayMs } from "./backoff";
 import { SseParser, type SseMessage } from "./sse";
+import { clearSessionValue, readSessionValue, writeSessionValue } from "./storage";
 
 export type RunStreamStatus = "idle" | "connecting" | "connected" | "reconnecting";
+
+/** Server-minted run ids: 1-64 alphanumerics, `_` or `-`. Twin of the
+ * server-side RUN_ID_RE in lib/telemetry/paths.ts (kept separate: that
+ * module imports node builtins, which client code must not pull in). */
+export const RUN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export interface RunStreamItem {
   /** Monotonic display order (mirrors the server seq when ids are numeric). */
@@ -125,7 +131,94 @@ export function getRunStreamBadge(state: Pick<RunStreamState, "status" | "items"
 }
 
 const MAX_LINES = 2000;
+/** Upper bound on the buffered items once a truncated replay is backfilled. */
+const BACKFILL_MAX_ITEMS = 10_000;
 const DEFAULT_EVENT = "message";
+
+/**
+ * The first event id of a truncated replay, from the server's `run.snapshot`
+ * announcement (seq 0, `data: { truncated: true, firstEventId, ... }`), or
+ * null when the replay is complete. The snapshot sorts before every real
+ * event, so it is the first item when present.
+ */
+export function snapshotTruncation(items: readonly RunStreamItem[]): number | null {
+  for (const item of items) {
+    if (item.kind !== "run.snapshot") continue;
+    const data = item.data;
+    if (!data || typeof data !== "object") return null;
+    const record = data as { truncated?: unknown; firstEventId?: unknown };
+    if (record.truncated !== true) return null;
+    return typeof record.firstEventId === "number" && Number.isFinite(record.firstEventId)
+      ? record.firstEventId
+      : null;
+  }
+  return null;
+}
+
+/**
+ * Parse the NDJSON run log (`GET /api/runtime/runs/[id]/log`: one persisted
+ * event per line, oldest first) into stream items. Lines without a numeric
+ * seq or a string type are legacy noise and are skipped. Item seqs come from
+ * the log's own sequence numbers so the backfilled head orders before the
+ * replayed tail; the live stream's local counter takes over after that.
+ */
+export function parseRunLogNdjson(text: string): RunStreamItem[] {
+  const items: RunStreamItem[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object") continue;
+    const record = event as { seq?: unknown; type?: unknown; ts?: unknown; data?: unknown };
+    if (typeof record.seq !== "number" || !Number.isFinite(record.seq)) continue;
+    if (typeof record.type !== "string" || !record.type) continue;
+    items.push({
+      seq: record.seq,
+      kind: record.type,
+      data: record.data,
+      parsed: { data: trimmed, event: record.type, id: String(record.seq) },
+      ts: typeof record.ts === "number" && Number.isFinite(record.ts) ? record.ts : Date.now(),
+    });
+  }
+  return items;
+}
+
+/**
+ * Fill in the head a capped replay omitted, from the persisted log.
+ * Returns null when there is nothing to fill (no truncated snapshot, or the
+ * log holds no events below the replay window). Otherwise the logged events
+ * below firstEventId are prepended (in log order) and the snapshot item is
+ * dropped — the view is complete, so the "showing recent events" note clears.
+ * When the merged history would exceed maxItems the backfill is refused
+ * (null) instead of silently dropping the head again; the snapshot stays and
+ * the capped tail remains the view.
+ */
+export function backfillTruncatedItems(
+  current: readonly RunStreamItem[],
+  logged: readonly RunStreamItem[],
+  maxItems: number = BACKFILL_MAX_ITEMS,
+): { items: RunStreamItem[]; complete: boolean } | null {
+  const firstEventId = snapshotTruncation(current);
+  if (firstEventId === null) return null;
+  const missing = logged.filter((item) => item.seq < firstEventId);
+  const rest = current.filter((item) => item.kind !== "run.snapshot");
+  const mergedCount = missing.length + rest.length;
+  if (mergedCount > maxItems) return null;
+  // Item seqs are the live stream's local counter, not the server's: renumber
+  // the backfilled head so its seqs are unique and sort before the replayed
+  // tail (the server seq survives in parsed.id).
+  const anchor = rest[0]?.seq ?? 0;
+  const renumbered = missing.map((item, index) => ({
+    ...item,
+    seq: anchor - missing.length + index,
+  }));
+  return { items: [...renumbered, ...rest], complete: true };
+}
 
 /**
  * A cursor (buffered events + Last-Event-ID) must only be kept when the same
@@ -154,30 +247,15 @@ export function sseCursorKey(runId: string): string {
 }
 
 export function readSseCursor(runId: string): string | undefined {
-  try {
-    if (typeof sessionStorage === "undefined") return undefined;
-    return sessionStorage.getItem(sseCursorKey(runId)) ?? undefined;
-  } catch {
-    return undefined;
-  }
+  return readSessionValue(sseCursorKey(runId));
 }
 
 export function writeSseCursor(runId: string, id: string): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    sessionStorage.setItem(sseCursorKey(runId), id);
-  } catch {
-    // Storage full or blocked: the in-memory cursor still works.
-  }
+  writeSessionValue(sseCursorKey(runId), id);
 }
 
 export function clearSseCursor(runId: string): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    sessionStorage.removeItem(sseCursorKey(runId));
-  } catch {
-    // ignore
-  }
+  clearSessionValue(sseCursorKey(runId));
 }
 
 export function useRunStream(runId?: string | null): RunStreamState {
@@ -192,6 +270,8 @@ export function useRunStream(runId?: string | null): RunStreamState {
   const lastIdRef = useRef<string | undefined>(undefined);
   const seqRef = useRef(0);
   const cursorRunIdRef = useRef<string | null | undefined>(undefined);
+  // A truncated replay is backfilled from the persisted log once per run.
+  const backfillStartedRef = useRef(false);
 
   useEffect(() => {
     const switched = shouldResetStreamCursor(cursorRunIdRef.current, runId);
@@ -202,6 +282,7 @@ export function useRunStream(runId?: string | null): RunStreamState {
       itemsRef.current = [];
       lastIdRef.current = undefined;
       seqRef.current = 0;
+      backfillStartedRef.current = false;
       setItems([]);
       setError(undefined);
       setReconnectAttempt(0);
@@ -213,6 +294,15 @@ export function useRunStream(runId?: string | null): RunStreamState {
     if (!lastIdRef.current && runId) lastIdRef.current = readSseCursor(runId);
 
     if (!runId) {
+      setStatus("idle");
+      return;
+    }
+
+    // The run id lands in the stream URL, so only a server-minted shape may
+    // reach the fetch: anything else (e.g. a poisoned storage hint) is
+    // refused instead of being interpolated into a request (Sonar S8476).
+    if (!RUN_ID_RE.test(runId)) {
+      setError("Invalid run id.");
       setStatus("idle");
       return;
     }
@@ -280,6 +370,35 @@ export function useRunStream(runId?: string | null): RunStreamState {
               }
             }
             pushItem(kind, data, m);
+            // The server announces a capped replay with a `run.snapshot`
+            // (truncated: true). Fill in the omitted head from the persisted
+            // log so a long run's timeline is complete, not a tail with a
+            // note. A failed fetch leaves the snapshot (and its note) in place.
+            if (
+              kind === "run.snapshot" &&
+              !backfillStartedRef.current &&
+              typeof data === "object" &&
+              data !== null &&
+              (data as { truncated?: unknown }).truncated === true
+            ) {
+              backfillStartedRef.current = true;
+              void (async () => {
+                try {
+                  const res = await fetch(`/api/runtime/runs/${encodeURIComponent(runId)}/log`, {
+                    signal: outer.signal,
+                  });
+                  if (!res.ok) return;
+                  const text = await res.text();
+                  if (!alive) return;
+                  const merged = backfillTruncatedItems(itemsRef.current, parseRunLogNdjson(text));
+                  if (!merged) return;
+                  itemsRef.current = merged.items;
+                  setItems(merged.items);
+                } catch {
+                  // The capped tail stays; the snapshot note stays honest.
+                }
+              })();
+            }
             if (isTerminalRunEvent(kind)) {
               sawTerminal = true;
               terminalKind = kind;

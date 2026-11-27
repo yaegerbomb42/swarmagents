@@ -128,6 +128,9 @@ test("a corrupt gardener.json falls back to empty state instead of throwing", ()
     fs.writeFileSync(path.join(dir, "gardener.json"), "{not json");
     assert.deepEqual(loadGardener(), { version: 1, users: {} });
     assert.deepEqual(readUserGardener("local"), { enabled: false, maxDifficulty: "medium", pinned: [], proposals: [] });
+    const backups = fs.readdirSync(dir).filter((f) => f.startsWith("gardener.json.corrupt-"));
+    assert.ok(backups.length >= 1, "corrupt file is backed up before any save can overwrite it");
+    assert.equal(fs.readFileSync(path.join(dir, backups[0]), "utf8"), "{not json");
   } finally {
     configureGardenerDir(null);
   }

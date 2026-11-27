@@ -142,7 +142,7 @@ export const TEXT_DESKTOP_ENV = "SWARM_TEXT_DESKTOP";
 export const TEXT_DESKTOP_TAIL =
   "You are running in text-desktop mode: you cannot see images. To inspect the desktop, call " +
   "describe_screen — it returns window bounds/centers, OCR text coordinates you can click, " +
-  "and the ordered text of the active window (last 15 lines). " +
+  "and, for a terminal, the ordered text of its last 15 lines. " +
   "To read full command/app output (cat results, errors, codes), call read_window_text " +
   "- it returns the last lines of a window's text. " +
   "To inspect the browser, call browser_snapshot (the page's accessibility tree as text). " +

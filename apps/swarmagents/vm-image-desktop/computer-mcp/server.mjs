@@ -352,9 +352,14 @@ async function describeScreen(args) {
 
     // Ordered text of the focused window, produced by the same pipeline as
     // read_window_text — a text-only model can read cat/compiler output
-    // without the word-level click targets.
-    const winText = await activeWindowTextSection({ run, env: CHILD_ENV });
-    if (winText) lines.push(winText);
+    // without the word-level click targets. Terminals only: for GUI apps
+    // (spreadsheets, editors) a full-window OCR dump is slow noise next to
+    // the click targets above; read_window_text stays available for them.
+    const klass = await activeWindowClass({ env: CHILD_ENV, timeoutMs: 3_000 });
+    if (isTerminalClass(klass)) {
+      const winText = await activeWindowTextSection({ run, env: CHILD_ENV });
+      if (winText) lines.push(winText);
+    }
   }
 
   return textResult(lines.join("\n"));

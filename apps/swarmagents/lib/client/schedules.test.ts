@@ -58,3 +58,15 @@ test("unreadScheduledRuns filters out seen run IDs and sorts newest first", () =
     ["r3", "r1"],
   );
 });
+
+test("unreadScheduledRuns: runs before the tracking floor are never unread (fresh browser)", async () => {
+  const { unreadScheduledRuns } = await import("./schedules");
+  const base = { name: "n", prompt: "p", intervalMinutes: 60, enabled: true, nextRunAt: 0 };
+  const schedules = [
+    { ...base, id: "old", lastRunId: "run_old", lastRunAt: 1_000 },
+    { ...base, id: "new", lastRunId: "run_new", lastRunAt: 5_000 },
+  ];
+  assert.deepEqual(unreadScheduledRuns(schedules, [], 2_000).map((u) => u.runId), ["run_new"]);
+  assert.deepEqual(unreadScheduledRuns(schedules, [], Number.POSITIVE_INFINITY), []);
+  assert.equal(unreadScheduledRuns(schedules, []).length, 2, "default floor keeps the old behaviour");
+});

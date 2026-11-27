@@ -579,6 +579,11 @@ the footprint of one heavy user machine.
 
 ### Warm VM pool (`SWARM_VM_WARM_POOL_SIZE`)
 
+> **Not active in production yet.** Only the fake (test) driver implements the
+> warm-pool capability. With the docker driver the setting is ignored and the
+> app logs `[vm] SWARM_VM_WARM_POOL_SIZE=… is ignored` once at boot; leave it
+> unset on the VPS until the docker driver gains prewarm/adoptWarm.
+
 Cold-starting a desktop VM (Docker + Xvnc + XFCE + Chromium) takes several
 seconds per new user. `SWARM_VM_WARM_POOL_SIZE` (default `0` = off) keeps a
 bounded pool of pre-booted, unassigned VMs so a user's first `ensure()`

@@ -237,14 +237,8 @@ test("desktopMcpServerEntry produces concrete stdio entries for the desktop serv
   assert.equal(playwright?.command, "node");
   assert.deepEqual((playwright as { args: string[] }).args, [
     "/workspace/.swarm/playwright-mcp-launcher.cjs",
-    "--browser", "chromium",
-    "--executable-path", "/usr/bin/chromium",
-    "--user-data-dir", "/workspace/.swarm/browser-profile",
-    "--no-sandbox",
+    "--cdp-endpoint", "http://127.0.0.1:9222",
     "--init-page", "/workspace/.swarm/playwright-policy.cjs",
-    // The CDP debug port rides in a config file: the playwright-mcp CLI
-    // rejects unknown flags, so it cannot go on the command line (l10).
-    "--config", "/workspace/.swarm/playwright-mcp.config.json",
   ]);
   assert.deepEqual((playwright as { env: Record<string, string> }).env, { DISPLAY: ":1" });
   // Unknown ids never produce an entry — a role can only wire what we ship.
@@ -330,6 +324,16 @@ test("roleMcpConfigJson wires the desktop servers only for desktop roles in desk
   const mainDesktop = withDesktop(mainRole(), true);
   assert.ok(mainDesktop.mcpServers["computer-mcp"], "main gets computer-mcp in desktop mode");
   assert.ok(mainDesktop.mcpServers["playwright-mcp"], "main gets playwright-mcp in desktop mode");
+  // The headed Playwright entry attaches to the visible Chromium via its
+  // loopback CDP endpoint — it must not launch a second browser.
+  const playwrightEntry = mainDesktop.mcpServers["playwright-mcp"] as { args?: string[] };
+  assert.deepEqual(playwrightEntry.args?.slice(0, 3), [
+    "/workspace/.swarm/playwright-mcp-launcher.cjs",
+    "--cdp-endpoint",
+    "http://127.0.0.1:9222",
+  ]);
+  assert.ok(!playwrightEntry.args?.includes("--browser"), "CDP mode launches no browser");
+  assert.ok(!playwrightEntry.args?.includes("--user-data-dir"), "CDP mode needs no profile arg");
 
   // Desktop mode off -> exactly today's surface (roles server only, here).
   const mainLegacy = withDesktop(mainRole(), false);

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { PLAYWRIGHT_LAUNCHER_SOURCE, PLAYWRIGHT_MCP_CONFIG_SOURCE, PLAYWRIGHT_POLICY_SOURCE, PLAYWRIGHT_PROXY_SOURCE, PLAYWRIGHT_PROXY_VERSION } from "./playwright-policy";
+import { PLAYWRIGHT_LAUNCHER_SOURCE, PLAYWRIGHT_POLICY_SOURCE, PLAYWRIGHT_PROXY_SOURCE, PLAYWRIGHT_PROXY_VERSION } from "./playwright-policy";
 
 type RouteHandler = (route: { abort: (reason: string) => Promise<void>; continue: () => Promise<void> }, request: { url: () => string }) => Promise<void>;
 
@@ -595,11 +595,182 @@ test("Playwright launcher replaces a stale-version proxy and logs its stderr", a
   assert.deepEqual(exits, [], "the launcher must not exit while replacing the proxy");
 });
 
-test("Playwright MCP config opens the CDP debug port for the Browser tab mirror", () => {
-  const config = JSON.parse(PLAYWRIGHT_MCP_CONFIG_SOURCE) as {
-    browser?: { launchOptions?: { args?: string[] } };
+/** Run the launcher source with stubbed http/fs/child_process/process. */
+async function runLauncherStub(opts: {
+  argv: string[];
+  cdpScript: Array<{ status: number } | { error: true }>;
+}): Promise<{
+  spawnCalls: Array<{ cmd: string; args: string[]; options: Record<string, unknown> }>;
+  exits: number[];
+  cdpCalls: number;
+  errors: string[];
+}> {
+  const CURRENT = PLAYWRIGHT_PROXY_VERSION;
+  const spawnCalls: Array<{ cmd: string; args: string[]; options: Record<string, unknown> }> = [];
+  const exits: number[] = [];
+  const errors: string[] = [];
+  let cdpCalls = 0;
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
   };
-  // The debug port rides in a config file because the playwright-mcp CLI
-  // rejects unknown flags (verified against @playwright/mcp@0.0.85).
-  assert.deepEqual(config.browser?.launchOptions?.args, ["--remote-debugging-port=9222"]);
+  try {
+    function fakeResponse(status: number) {
+      const handlers: Record<string, (...args: unknown[]) => void> = {};
+      return {
+        statusCode: status,
+        on: (event: string, fn: (...args: unknown[]) => void) => {
+          handlers[event] = fn;
+        },
+        resume: () => {},
+        _emit: () => {
+          handlers["end"]?.();
+        },
+      };
+    }
+    const httpStub = {
+      get: (url: string, _options: unknown, cb: (res: ReturnType<typeof fakeResponse>) => void) => {
+        const handlers: Record<string, (...args: unknown[]) => void> = {};
+        queueMicrotask(() => {
+          if (url.includes("/json/version")) {
+            cdpCalls += 1;
+            const scripted = opts.cdpScript[Math.min(cdpCalls - 1, opts.cdpScript.length - 1)]!;
+            if ("error" in scripted) {
+              handlers["error"]?.(new Error("ECONNREFUSED"));
+              return;
+            }
+            const res = fakeResponse(scripted.status);
+            cb(res);
+            res._emit();
+            return;
+          }
+          const res = fakeResponse(200);
+          cb(res);
+          // The health handler reads the body; answer with the current version.
+          res._emit();
+        });
+        return { on: (event: string, fn: (...args: unknown[]) => void) => {
+          handlers[event] = fn;
+        }, destroy: () => {} };
+      },
+      request: (_url: string, _options: unknown, cb: (res: ReturnType<typeof fakeResponse>) => void) => {
+        const handlers: Record<string, (...args: unknown[]) => void> = {};
+        queueMicrotask(() => {
+          const res = fakeResponse(200);
+          cb(res);
+          res._emit();
+        });
+        return { on: (event: string, fn: (...args: unknown[]) => void) => {
+          handlers[event] = fn;
+        }, destroy: () => {}, end: () => {} };
+      },
+    };
+    // The health check reads the response body via data events; the stub
+    // above emits no data, so patch the health answer: instead of relying
+    // on the body, answer health through the same fake with a data event.
+    const fsStub = {
+      existsSync: () => false,
+      statSync: () => ({ size: 0 }),
+      renameSync: () => {},
+      unlinkSync: () => {},
+      openSync: () => 9,
+    };
+    const requireStub = (specifier: string): unknown => {
+      switch (specifier) {
+        case "node:http":
+          return httpStub;
+        case "node:fs":
+          return fsStub;
+        case "node:child_process":
+          return {
+            spawn: (cmd: string, args: string[], options: Record<string, unknown>) => {
+              spawnCalls.push({ cmd, args, options });
+              return { unref: () => {}, on: () => {}, kill: () => {} };
+            },
+          };
+        default:
+          throw new Error(`unexpected require: ${specifier}`);
+      }
+    };
+    const processStub = {
+      execPath: "/usr/bin/node",
+      argv: ["node", "launcher.cjs", ...opts.argv],
+      env: {},
+      on: () => {},
+      kill: () => {},
+      pid: 123,
+      exit: (code: number) => {
+        exits.push(code);
+      },
+    };
+    // The launcher's health check compares the response body to the proxy
+    // version; make the stub emit the version line as a data chunk.
+    const realGet = httpStub.get;
+    httpStub.get = (url: string, options: unknown, cb: (res: ReturnType<typeof fakeResponse>) => void) => {
+      if (url.includes("/__swarm_policy_health")) {
+        const handlers: Record<string, (...args: unknown[]) => void> = {};
+        queueMicrotask(() => {
+          const res = {
+            statusCode: 200,
+            on: (event: string, fn: (...args: unknown[]) => void) => {
+              handlers[event] = fn;
+            },
+            resume: () => {},
+          };
+          cb(res as never);
+          handlers["data"]?.(`swarm-playwright-policy ${CURRENT}\n`);
+          handlers["end"]?.();
+        });
+        return { on: (event: string, fn: (...args: unknown[]) => void) => {
+          handlers[event] = fn;
+        }, destroy: () => {} };
+      }
+      return realGet(url, options, cb);
+    };
+    new Function("require", "module", "exports", "process", PLAYWRIGHT_LAUNCHER_SOURCE)(
+      requireStub,
+      { exports: {} },
+      {},
+      processStub,
+    );
+    const deadline = Date.now() + 15000;
+    while (
+      !spawnCalls.some((c) => c.cmd === "playwright-mcp") &&
+      exits.length === 0 &&
+      Date.now() < deadline
+    ) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { spawnCalls, exits, cdpCalls, errors };
+  } finally {
+    console.error = consoleError;
+  }
+}
+
+test("Playwright launcher waits for the desktop Chromium CDP endpoint before attaching", async () => {
+  const { spawnCalls, exits, cdpCalls } = await runLauncherStub({
+    argv: ["--cdp-endpoint", "http://127.0.0.1:9222", "--init-page", "/workspace/.swarm/playwright-policy.cjs"],
+    cdpScript: [{ error: true }, { status: 200 }],
+  });
+  const mcp = spawnCalls.find((c) => c.cmd === "playwright-mcp");
+  assert.ok(mcp, "the launcher must exec playwright-mcp once CDP answers");
+  assert.ok(cdpCalls >= 2, `CDP was probed until it answered (probed ${cdpCalls}x)`);
+  assert.deepEqual(
+    mcp!.args.slice(0, 2),
+    ["--cdp-endpoint", "http://127.0.0.1:9222"],
+    "the server attaches via the CDP endpoint, it does not launch a browser",
+  );
+  assert.ok(!mcp!.args.includes("--browser"), "CDP mode passes no --browser flag");
+  assert.ok(mcp!.args.includes("--proxy-server"), "the policy proxy is still applied in CDP mode");
+  assert.deepEqual(exits, [], "the launcher must not exit while the server runs");
+});
+
+test("Playwright launcher fails clearly when the desktop Chromium CDP endpoint never appears", async () => {
+  const { spawnCalls, exits, errors } = await runLauncherStub({
+    argv: ["--cdp-endpoint", "http://127.0.0.1:9222", "--init-page", "/workspace/.swarm/playwright-policy.cjs"],
+    cdpScript: [{ error: true }],
+  });
+  assert.equal(spawnCalls.some((c) => c.cmd === "playwright-mcp"), false, "no server starts without a browser to attach to");
+  assert.deepEqual(exits, [1], "the launcher exits non-zero");
+  assert.ok(errors.some((e) => e.includes("http://127.0.0.1:9222")), "the error names the missing endpoint");
 });

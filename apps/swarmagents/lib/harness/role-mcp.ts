@@ -34,7 +34,6 @@ import {
 } from "../roles";
 import type { RolePhase } from "./types";
 import { SWARM_VM_DESKTOP_ENV } from "../vm/desktop";
-import { VM_BROWSER_PROFILE_PATH } from "../vm/manager";
 import { SELF_MANAGE_TAIL } from "../self-manage/prompt";
 import { CODEBASE_MCP_SERVER_NAME, CODEBASE_MCP_SERVER_PATH, codebaseMcpServerSource } from "./codebase-mcp-source";
 import {
@@ -73,8 +72,6 @@ import {
 import {
   PLAYWRIGHT_LAUNCHER_PATH,
   PLAYWRIGHT_LAUNCHER_SOURCE,
-  PLAYWRIGHT_MCP_CONFIG_PATH,
-  PLAYWRIGHT_MCP_CONFIG_SOURCE,
   PLAYWRIGHT_POLICY_PATH,
   PLAYWRIGHT_POLICY_SOURCE,
   PLAYWRIGHT_PROXY_PATH,
@@ -137,6 +134,16 @@ export const A1_OPERATING_GUIDANCE =
 export const COMPUTER_MCP_SERVER_PATH = "/opt/swarm/computer-mcp/server.mjs";
 /** The Playwright MCP CLI (installed globally in both VM images). */
 export const PLAYWRIGHT_MCP_COMMAND = "playwright-mcp";
+/**
+ * CDP endpoint of the visible desktop Chromium (loopback only). The
+ * autostarted Chromium on DISPLAY :1 is launched with
+ * --remote-debugging-port=9222 (see vm-image-desktop/files/chromium-launch.sh);
+ * the headed Playwright MCP server attaches to that same window instead of
+ * launching a second Chromium on the shared profile (whose singleton lock
+ * would make the launch fail — the new process forwards to the running
+ * instance and exits without a CDP session to drive).
+ */
+export const PLAYWRIGHT_CDP_ENDPOINT = "http://127.0.0.1:9222";
 /** Headless, agent-controllable browser server (distinct from desktop Playwright). */
 export const BROWSER_MCP_SERVER_NAME = "browser-mcp";
 /** Env flag the computer-mcp server reads: screenshot returns describe_screen text. */
@@ -200,13 +207,18 @@ export function desktopMcpServerEntry(
       type: "stdio",
       command: "node",
       // Headed by default (the user sees every navigation on the desktop).
-      // The launcher also starts the loopback network-policy proxy.
-      // The browser profile is the persistent one on the /workspace volume,
-      // shared with the desktop Chromium, so logins survive hibernation.
-      // --config opens the CDP debug port (9222) on this browser so the
-      // Browser tab can mirror it; the flag cannot go on the command line
-      // (the playwright-mcp CLI rejects unknown flags).
-      args: [PLAYWRIGHT_LAUNCHER_PATH, "--browser", "chromium", "--executable-path", "/usr/bin/chromium", "--user-data-dir", VM_BROWSER_PROFILE_PATH, "--no-sandbox", "--init-page", PLAYWRIGHT_POLICY_PATH, "--config", PLAYWRIGHT_MCP_CONFIG_PATH],
+      // Attaches via CDP to the visible Chromium the desktop autostarted
+      // on DISPLAY :1 — no second browser process, so no fight over the
+      // shared profile's singleton lock (a fresh launch against the locked
+      // profile forwards to the running instance and exits with no CDP
+      // session to drive). The launcher waits for the CDP endpoint to
+      // answer before spawning the server (see playwright-policy). The
+      // launcher also starts the loopback network-policy proxy. The debug
+      // port itself belongs to the autostarted Chromium (see
+      // vm-image-desktop/files/chromium-launch.sh); the Browser tab mirror
+      // (l10) reaches that same browser through its socat forwarder
+      // (VM:9223 -> 127.0.0.1:9222), so no --config launch flag is needed.
+      args: [PLAYWRIGHT_LAUNCHER_PATH, "--cdp-endpoint", PLAYWRIGHT_CDP_ENDPOINT, "--init-page", PLAYWRIGHT_POLICY_PATH],
       env: { DISPLAY: ":1" },
     };
   }
@@ -560,10 +572,6 @@ export function roleSeedFiles(
     { path: PLAYWRIGHT_POLICY_PATH, content: PLAYWRIGHT_POLICY_SOURCE },
     { path: PLAYWRIGHT_PROXY_PATH, content: PLAYWRIGHT_PROXY_SOURCE },
     { path: PLAYWRIGHT_LAUNCHER_PATH, content: PLAYWRIGHT_LAUNCHER_SOURCE },
-    // The headed Playwright MCP config (CDP debug port for the Browser tab
-    // mirror). Seeded unconditionally like the launcher: the config is inert
-    // unless the headed entry passes --config.
-    { path: PLAYWRIGHT_MCP_CONFIG_PATH, content: PLAYWRIGHT_MCP_CONFIG_SOURCE },
     { path: ROLE_CATALOG_PATH, content: roleCatalogJson(catalog) },
     { path: CODEBASE_MCP_SERVER_PATH, content: codebaseMcpServerSource() },
     // Seeded unconditionally (like the codebase server): the file is inert

@@ -463,7 +463,7 @@ function WorkspaceRail({
       const dir = Number(b.type === "directory") - Number(a.type === "directory");
       return dir !== 0 ? dir : a.name.localeCompare(b.name);
     });
-    return activityOnly ? ordered.filter(isActivityVisible) : ordered;
+    return activityOnly ? ordered.filter((entry) => isActivityVisible(entry)) : ordered;
   }, [entries, activityOnly, isActivityVisible]);
 
   const renderEntry = (entry: WorkspaceEntry, depth: number): React.ReactNode => {

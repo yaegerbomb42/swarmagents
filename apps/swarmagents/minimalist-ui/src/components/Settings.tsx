@@ -4,7 +4,7 @@ import {
   AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Play, Plug, Plus, Sparkles, Trash2, X, Zap,
 } from 'lucide-react';
 import {
-  type ActiveRole, type ApiFormat, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
+  type ActiveRole, type ApiFormat, FRONTIER_HARNESSES, type FrontierHarness, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
 } from '../data';
 import { callProvider } from '../engine';
 import { SampleTaskPicker } from './FirstRunSetup';
@@ -574,6 +574,73 @@ const fmtQuotaTime = (until: number): string => {
   const d = new Date(until);
   return `~${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 };
+
+/** What clicking a frontier harness does: add its provider preset (which
+ *  opens the key entry — the normal provider-setup flow) when it is not
+ *  configured yet, or jump to the already-configured provider card when it
+ *  is. Pure so the click routing is unit-testable without a DOM. */
+export type FrontierHarnessAction =
+  | { kind: 'add'; presetId: string }
+  | { kind: 'expand'; uid: string };
+
+export function resolveFrontierHarnessAction(
+  harness: FrontierHarness,
+  providers: ProviderConfig[],
+): FrontierHarnessAction {
+  const existing = providers.find((p) => p.presetId === harness.presetId);
+  return existing ? { kind: 'expand', uid: existing.uid } : { kind: 'add', presetId: harness.presetId };
+}
+
+/**
+ * Frontier harnesses — the three frontier agent stacks from the morning
+ * target (Grok / Muse / Arena), one click each. Clicking Configure adds
+ * the harness's provider preset and opens its key entry; clicking a
+ * harness that is already configured jumps to its provider card instead.
+ * No new settings page: this reuses the existing provider-setup flow.
+ */
+export function FrontierHarnesses({
+  providers,
+  onConfigure,
+  onExpand,
+}: {
+  providers: ProviderConfig[];
+  onConfigure: (presetId: string) => void;
+  onExpand: (uid: string) => void;
+}) {
+  return (
+    <section>
+      <Label>Frontier harnesses</Label>
+      <p className="mb-2 text-[11px] leading-relaxed text-white/40">
+        Frontier agent stacks you can point A1 at — each one wires up its provider in one click; the harness itself runs outside SwarmAgents.
+      </p>
+      <div className="space-y-2">
+        {FRONTIER_HARNESSES.map((h) => {
+          const action = resolveFrontierHarnessAction(h, providers);
+          const preset = PROVIDERS.find((p) => p.id === h.presetId);
+          return (
+            <div key={h.id} className="flex items-start justify-between gap-3 rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-xs text-white/85">
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: preset?.color ?? '#94a3b8' }} />
+                  {h.name}
+                  <span className="truncate font-mono text-[10px] text-white/35">{preset?.model ?? ''}</span>
+                </div>
+                <div className="mt-0.5 text-[11px] leading-relaxed text-white/50">{h.blurb}</div>
+                <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">{h.harnessNote}</div>
+              </div>
+              <button
+                onClick={() => (action.kind === 'add' ? onConfigure(action.presetId) : onExpand(action.uid))}
+                className="shrink-0 rounded-full bg-white/5 px-3 py-1.5 text-xs text-white/70 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
+              >
+                {action.kind === 'add' ? 'Configure' : 'Configured'}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
 
 function Providers({
   providers,
@@ -1504,6 +1571,12 @@ function Providers({
         </div>
       </section>
 
+      <FrontierHarnesses
+        providers={providers}
+        onConfigure={(presetId) => add(presetId)}
+        onExpand={(uid) => setExpanded(uid)}
+      />
+
       <section>
         <Label>Configured</Label>
         {serverProviderCount > 0 && (
@@ -2162,6 +2235,7 @@ function ProviderCard({
                 className="w-full rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
               >
                 <option value="openai">OpenAI-compatible</option>
+                <option value="responses">OpenAI Responses</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
                 <option value="cohere">Cohere v2</option>

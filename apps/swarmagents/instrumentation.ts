@@ -25,6 +25,8 @@ export async function register(): Promise<void> {
     }
     const { registerShutdownHandler } = await import("./lib/runtime/shutdown");
     registerShutdownHandler();
+    const { reconcileInterruptedRunsOnStartup } = await import("./lib/runtime/recovery");
+    reconcileInterruptedRunsOnStartup();
     const { migrateLegacyProvidersAtStartup } = await import("./lib/providers/migrate");
     migrateLegacyProvidersAtStartup();
     // One-time share token index (bug 19): after this, resolving a share

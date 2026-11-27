@@ -1620,6 +1620,7 @@ const VERIFICATION_COMMAND_RE =
 /** Desktop/browser tools that inspect the rendered result of a UI change. */
 const VERIFICATION_TOOL_NAMES = new Set([
   "describe_screen",
+  "read_window_text",
   "screenshot",
   "browser_snapshot",
   "browser_take_screenshot",

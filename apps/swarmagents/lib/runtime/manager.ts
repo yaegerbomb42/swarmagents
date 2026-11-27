@@ -468,6 +468,8 @@ export interface RunSummary {
   verification?: RunVerificationMeta;
   /** F1: which run + checkpoint this run was forked from, if it is a fork. */
   forkedFrom?: ForkInfo;
+  /** l9: the run this run steered from, when it replaced a live run mid-flight. */
+  steeredFrom?: string;
 }
 
 interface QueuedRun {
@@ -517,6 +519,8 @@ interface QueuedRun {
   seedSnapshotLabel?: string;
   /** F1 fork provenance: the run + checkpoint this run was forked from. */
   forkedFrom?: ForkInfo;
+  /** l9: the run this run steered from, when it replaced a live run mid-flight. */
+  steeredFrom?: string;
   /** Daemon resume: the recorded checkpoint this run resumes from, if any. */
   resumePoint?: ResumePoint;
   /** Watchdog recoveries already spent on this run (bounded; see maxRecoveryAttempts). */
@@ -669,6 +673,8 @@ interface ActiveRun {
   seedSnapshotLabel?: string;
   /** F1 fork provenance: the run + checkpoint this run was forked from. */
   forkedFrom?: ForkInfo;
+  /** l9: the run this run steered from, when it replaced a live run mid-flight. */
+  steeredFrom?: string;
   /** Latest recorded resume point for this run (from auto-checkpoint). */
   resumePoint?: ResumePoint;
   /** Tool calls emitted but not yet closed by a result (turn tracking). */
@@ -2286,6 +2292,8 @@ export class RuntimeManager {
       seedSnapshotLabel?: string;
       /** F1 fork provenance: the run + checkpoint this run was forked from. */
       forkedFrom?: ForkInfo;
+      /** l9: the run this run steered from; set only by steer(). */
+      steeredFrom?: string;
       /**
        * F1 fork: start a fresh conversation instead of resuming the user's
        * last session. A fork continues from a checkpoint's workspace, not
@@ -2359,8 +2367,11 @@ export class RuntimeManager {
     // scheduleRestoredStarts). If a fresh prompt lands in that window,
     // start the restored head first so FIFO order matches the old
     // synchronous restore; this prompt then queues behind it as usual.
-    // In steady state the condition is unreachable (finalize drains).
-    if (!st.active && st.queue.length > 0) this.startNext(userId);
+    // In steady state the condition is unreachable (finalize drains) —
+    // except for steer(), which finalizes with drainQueue=false so the
+    // steered run takes the slot itself: a steered run must NOT drain the
+    // queue first, or the queued head would jump ahead of it.
+    if (!st.active && st.queue.length > 0 && !input.steeredFrom) this.startNext(userId);
     const fullAuto = input.fullAuto ?? process.env.SWARM_FULL_AUTO === "1";
     const runMode = this.modeFor(userId, input.model, input.tier);
 
@@ -2423,6 +2434,7 @@ export class RuntimeManager {
         runMode,
         seedSnapshotLabel: input.seedSnapshotLabel,
         forkedFrom: input.forkedFrom,
+        steeredFrom: input.steeredFrom,
         freshSession: input.freshSession,
         maxTurns,
         createdAt: Date.now(),
@@ -2474,6 +2486,7 @@ export class RuntimeManager {
       ambientRuleId: input.ambientRuleId,
       seedSnapshotLabel: input.seedSnapshotLabel,
       forkedFrom: input.forkedFrom,
+      steeredFrom: input.steeredFrom,
       maxTurns,
     };
     st.active = active;
@@ -2694,6 +2707,7 @@ export class RuntimeManager {
       ambientRuleId: next.ambientRuleId,
       seedSnapshotLabel: next.seedSnapshotLabel,
       forkedFrom: next.forkedFrom,
+      steeredFrom: next.steeredFrom,
       resumePoint: next.resumePoint,
       maxTurns: next.maxTurns,
       recoveryAttempts: next.recoveryAttempts,
@@ -2734,6 +2748,7 @@ export class RuntimeManager {
           ? { mode: run.runMode.mode, modeReason: run.runMode.reason }
           : {}),
         ...(run.forkedFrom ? { forkedFrom: run.forkedFrom } : {}),
+        ...(run.steeredFrom ? { steeredFrom: run.steeredFrom } : {}),
       });
     });
     for (const run of st.shellRuns.values()) {
@@ -3037,6 +3052,81 @@ export class RuntimeManager {
     return { ok: true, runId: removed.runId };
   }
 
+  /**
+   * l9 — steer mid-run: interrupt the active run and continue the same
+   * Claude session with new instructions, without losing context.
+   *
+   * The active run ends as `cancelled` with reason `superseded` (synchronous,
+   * so the slot frees at once) and a new run starts immediately with
+   * `--resume` of the superseded run's session and the prompt prefixed
+   * `User interrupted: `. The queue is left untouched: the finalize here
+   * passes drainQueue=false, so a queued prompt does NOT jump ahead of the
+   * steered run, and queued items stay queued behind it. A `run.steered`
+   * event on the new run's stream links both runIds for the timeline.
+   *
+   * The steered run carries the superseded run's agent, model, tier, project,
+   * agent card, full-auto flag, and starting role, so the continuation is
+   * the same session under the same policy. When the superseded run has no
+   * session yet (no session event arrived), sessionId is omitted and start()
+   * falls back to the account's last session, as a fresh send would.
+   */
+  steer(
+    userId: string,
+    text: string,
+  ): { ok: true; runId: string; steeredFrom: string; queued: boolean } | { ok: false; error: string } {
+    const prompt = text.trim();
+    if (!prompt) return { ok: false, error: "prompt is required." };
+    const st = this.state(userId);
+    const active = st.active;
+    if (!active) return { ok: false, error: "No active run to steer." };
+    const steeredFrom = active.runId;
+    const sessionId = active.sessionId;
+    const agentId = active.agentId;
+    // A custom role deleted since the run started must not strand the user
+    // with no run at all: fall back to the default role in that case.
+    let roleId: string | undefined;
+    if (active.role) {
+      try {
+        roleId = this.resolveRole(userId, active.role.id).id;
+      } catch {
+        roleId = undefined;
+      }
+    }
+    // Cancel exactly like cancel(), but WITHOUT draining the queue: the
+    // steered run takes the slot itself (see start() below), and anything
+    // already queued stays queued behind it.
+    this.recordCancelling(userId, steeredFrom, active.pgidFile, active.agentId);
+    this.finalize(steeredFrom, { status: "cancelled", cancelledReason: "superseded" }, false);
+    active.controller.abort();
+    const started = this.start(userId, {
+      prompt: `User interrupted: ${prompt}`,
+      ...(sessionId ? { sessionId } : {}),
+      ...(agentId ? { agentId } : {}),
+      ...(active.model ? { model: active.model } : {}),
+      ...(active.tier ? { tier: active.tier } : {}),
+      ...(active.projectId ? { projectId: active.projectId } : {}),
+      ...(active.agentCard ? { agentCard: active.agentCard } : {}),
+      ...(roleId ? { roleId } : {}),
+      fullAuto: active.fullAuto ?? undefined,
+      steeredFrom,
+    });
+    if (!started.accepted) {
+      return {
+        ok: false,
+        error: started.error ?? "The previous run was stopped, but the steered run could not start.",
+      };
+    }
+    // The bus event type is {type, data?}: publish through a typed const
+    // (as run.cancelled does) so the link fields are not excess properties.
+    const steeredEvent: { type: "run.steered"; fromRunId: string; toRunId: string } = {
+      type: "run.steered",
+      fromRunId: steeredFrom,
+      toRunId: started.runId,
+    };
+    this.bus.publish(started.runId, steeredEvent);
+    return { ok: true, runId: started.runId, steeredFrom, queued: started.queued };
+  }
+
   /** Finalize a prompt that never started as cancelled and add it to history. */
   private finalizeQueued(
     userId: string,
@@ -3325,6 +3415,7 @@ export class RuntimeManager {
         ? { mode: a.runMode.mode, modeReason: a.runMode.reason }
         : {}),
       ...(a.forkedFrom ? { forkedFrom: a.forkedFrom } : {}),
+      ...(a.steeredFrom ? { steeredFrom: a.steeredFrom } : {}),
       createdAt: a.createdAt,
       startedAt: a.startedAt,
       lastSeq: 0,

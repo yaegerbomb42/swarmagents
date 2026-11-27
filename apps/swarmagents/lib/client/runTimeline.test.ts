@@ -414,3 +414,11 @@ test("reduceRunTimeline ignores run.queued without touching the summary", () => 
   assert.deepEqual(timeline.tools, []);
   assert.equal(timeline.summary.model, "claude-opus");
 });
+
+test("run.steered records the run it continued from", () => {
+  const { summary } = reduceRunTimeline([
+    item("run.started", {}, T0, 1),
+    item("run.steered", { fromRunId: "run_old", toRunId: "run_new" }, T0 + 100, 2),
+  ]);
+  assert.equal(summary.steeredFrom, "run_old");
+});

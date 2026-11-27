@@ -358,6 +358,16 @@ export default function App() {
     [session, setView, wide],
   );
 
+  /** l9 — steer: interrupt the active run and continue its session. */
+  const handleSteer = useCallback(
+    async (text: string, attachments: Attachment[]): Promise<ComposerSendResult> => {
+      const result = await session.steer(text, attachments);
+      if (result.ok && !result.queued && wide) setView("screen");
+      return result.ok ? { ok: true } : { ok: false, error: result.error };
+    },
+    [session, setView, wide],
+  );
+
   /**
    * Dispatch a first-run sample task through the normal run path. The wizard
    * (or the Settings replay entry) closes and the workspace lands on the live
@@ -797,6 +807,8 @@ export default function App() {
             value={draft}
             onChange={setDraft}
             onSend={handleSend}
+            onSteer={handleSteer}
+            busy={busy}
             tier={tier}
             onTierChange={setTier}
             blockedReason={

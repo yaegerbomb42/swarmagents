@@ -221,6 +221,10 @@ export function toActivityLine(
       );
     }
 
+    case "run.steered": {
+      return line(item, "run.steered", "Steered · continuing the previous run", "accent");
+    }
+
     case "vm.starting": {
       return line(item, "vm.starting", "VM starting · booting isolated sandbox", "accent");
     }

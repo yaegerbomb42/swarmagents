@@ -44,6 +44,7 @@ import {
   resumeRun,
   startNewThread,
   startRun,
+  steerRun,
   stopRun,
   withUploadManifest,
   type RunTier,
@@ -155,6 +156,8 @@ export interface AgentSession {
   handoffs: OpenHandoff[];
 
   send: (text: string, attachments?: Attachment[], options?: SendOptions) => Promise<SendResult>;
+  /** l9: interrupt the active run and continue its session with new instructions. */
+  steer: (text: string, attachments?: Attachment[]) => Promise<SendResult>;
   stop: (runId?: string) => Promise<ActionResult>;
   resume: (runId: string) => Promise<ActionResult>;
   answerQuestion: (id: string, answer: string) => Promise<boolean>;
@@ -642,6 +645,65 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
     [refresh],
   );
 
+  // l9 — steer: same upload + optimistic-turn flow as a send, but the server
+  // interrupts the active run and continues its session instead of queueing
+  // behind it. The superseded run is marked cancelled locally at once; the
+  // new run continues the same session, so the thread key does not change.
+  const steer = useCallback(
+    async (rawText: string, attachments: Attachment[] = []): Promise<SendResult> => {
+      const typed = rawText.trim();
+      const files = attachments.filter((attachment) => attachment.file);
+      if (!typed && files.length === 0) return { ok: false, error: "Type a message first." };
+      const display: PromptDisplay = { text: typed, attachments: files.map((file) => file.name) };
+      const pendingId = uid();
+      setPending({ id: pendingId, ...display, ts: Date.now() });
+      setDispatching(true);
+      const fail = (error: string): SendResult => {
+        setPending((prev) => (prev?.id === pendingId ? undefined : prev));
+        setDispatching(false);
+        return { ok: false, error };
+      };
+      let uploadedFiles: Array<{ path: string; size: number }> = [];
+      if (files.length > 0) {
+        try {
+          const upload = await uploadAttachments(
+            files.map((file) => ({ name: file.name, size: file.size, type: file.type, file: file.file as File })),
+          );
+          uploadedFiles = upload.uploaded.map((uploaded) => ({ path: uploaded.path, size: uploaded.size }));
+        } catch (err) {
+          return fail(`Could not upload the attachments. ${err instanceof Error ? err.message : ""}`.trim());
+        }
+      }
+      const fullPrompt = withUploadManifest(typed, uploadedFiles);
+      const result = await steerRun(fullPrompt);
+      if (!result.ok) return fail(result.error);
+      const stopped: ThreadRunInput = {
+        runId: result.steeredFrom,
+        status: "cancelled",
+        finishedAt: Date.now(),
+      };
+      const started: ThreadRunInput = {
+        runId: result.runId,
+        prompt: fullPrompt,
+        status: result.queued ? "queued" : "running",
+        createdAt: Date.now(),
+        steeredFrom: result.steeredFrom,
+      };
+      dispatch({ type: "merge", runs: [stopped, started], limit: STORE_LIMIT });
+      setAccountRuns((prev) => [
+        started,
+        ...prev.map((run) => (run.runId === result.steeredFrom ? { ...run, ...stopped } : run)),
+      ]);
+      setLocalRunIds((prev) => [...prev, result.runId]);
+      setPromptCache((prev) => rememberPrompt(prev, result.runId, display));
+      setPending((prev) => (prev?.id === pendingId ? undefined : prev));
+      setDispatching(false);
+      refresh();
+      return { ok: true, runId: result.runId, queued: result.queued };
+    },
+    [refresh, setPromptCache],
+  );
+
   const answerQuestion = useCallback(async (id: string, answer: string): Promise<boolean> => {
     try {
       const res = await fetch("/api/runtime/questions", {
@@ -743,6 +805,7 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
     approvals,
     handoffs,
     send,
+    steer,
     stop,
     resume,
     answerQuestion,

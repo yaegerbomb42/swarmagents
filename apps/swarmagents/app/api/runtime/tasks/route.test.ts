@@ -827,3 +827,81 @@ test("POST with maxTurns passes --max-turns to claude; invalid maxTurns is rejec
   assert.equal(bad.status, 400);
   assert.match((await json(bad)).error ?? "", /maxTurns/);
 });
+
+test("POST steer supersedes the active run and resumes its session", async () => {
+  // Both claude calls delayed so the steered run is still running when the
+  // run list is asserted (the second call is the steered run itself).
+  const driver = new ScriptedFakeVm(FIXTURE_LINES, [5000, 5000]);
+  install(driver);
+
+  const first = await json(await postTask({ prompt: "build it in node", sessionId: "sess_route_1" }));
+  const runA = first.runId;
+  assert.ok(runA);
+  await waitForAgentCalls(driver, 1);
+
+  const res = await postTask({ action: "steer", prompt: "stop, use python instead" });
+  assert.equal(res.status, 201);
+  const body = await json(res);
+  assert.ok(body.runId);
+  assert.notEqual(body.runId, runA);
+  assert.equal(body.steeredFrom, runA);
+  assert.equal(body.queued, false);
+
+  const runs = await waitForRuns((r) => r.length === 2 && r.every((x) => x.status !== "running" || x.runId === body.runId));
+  const oldRun = runs.find((r) => r.runId === runA);
+  assert.equal(oldRun?.status, "cancelled");
+  assert.equal(oldRun?.cancelledReason, "superseded");
+  const newRun = runs.find((r) => r.runId === body.runId);
+  assert.equal(newRun?.status, "running");
+  assert.equal(newRun?.prompt, "User interrupted: stop, use python instead");
+  assert.equal(newRun?.sessionId, "sess_route_1");
+  assert.equal(newRun?.steeredFrom, runA);
+
+  await waitForAgentCalls(driver, 2);
+  const secondCmd = agentCalls(driver)[1].cmd;
+  const resumeIdx = secondCmd.indexOf("--resume");
+  assert.ok(resumeIdx !== -1, "steered run should include --resume");
+  assert.equal(secondCmd[resumeIdx + 1], "sess_route_1");
+  assert.equal(secondCmd[secondCmd.indexOf("--") + 1], "User interrupted: stop, use python instead");
+});
+
+test("POST steer with no active run returns 409; empty prompt returns 400", async () => {
+  const driver = new ScriptedFakeVm();
+  install(driver);
+
+  const none = await postTask({ action: "steer", prompt: "do something else" });
+  assert.equal(none.status, 409);
+  assert.match((await json(none)).error ?? "", /No active run/);
+
+  const { runId } = await json(await postTask({ prompt: "work" }));
+  assert.ok(runId);
+  const empty = await postTask({ action: "steer", prompt: "   " });
+  assert.equal(empty.status, 400);
+  assert.match((await json(empty)).error ?? "", /prompt is required/);
+});
+
+test("POST steer leaves queued prompts queued behind the steered run", async () => {
+  // Both claude calls delayed so the steered run is still running when the
+  // queue state is asserted (the second call is the steered run itself).
+  const driver = new ScriptedFakeVm(FIXTURE_LINES, [5000, 5000]);
+  install(driver);
+
+  const first = await json(await postTask({ prompt: "first work", sessionId: "sess_route_1" }));
+  await waitForAgentCalls(driver, 1);
+  const queued = await json(await postTask({ prompt: "queued follow-up" }));
+  assert.equal(queued.queued, true);
+
+  const steered = await json(await postTask({ action: "steer", prompt: "change of plan" }));
+  assert.equal(steered.queued, false);
+
+  const runs = await waitForRuns(
+    (r) =>
+      r.find((x) => x.runId === steered.runId)?.status === "running" &&
+      r.find((x) => x.runId === queued.runId)?.status === "queued",
+  );
+  assert.equal(runs.find((r) => r.runId === steered.runId)?.status, "running");
+  const stillQueued = runs.find((r) => r.runId === queued.runId);
+  assert.equal(stillQueued?.status, "queued");
+  assert.equal(stillQueued?.position, 1);
+  assert.equal(runs.find((r) => r.runId === first.runId)?.status, "cancelled");
+});

@@ -3,7 +3,7 @@
  * (run-terminal.mjs).
  *
  * `run_in_terminal` types a command into a visible terminal, presses Return,
- * and waits for the screen to settle (two consecutive OCR reads identical)
+ * and waits for the screen to settle (identical reads with a prompt back, or a quiet period)
  * before returning only the lines that appeared after the command was typed.
  * This module holds the pure pieces of that loop — the "what is new" diff and
  * the settle poll — so unit tests can exercise them with an injected reader
@@ -57,25 +57,63 @@ export function diffNewLines(current, before, { fallbackLines = RUN_TERMINAL_FAL
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Quiet period required when the screen is stable but no shell prompt is back yet (ms). */
+export const RUN_TERMINAL_QUIET_MS = 3000;
+
+/**
+ * Does the newest non-empty OCR line look like an idle shell prompt
+ * (`user@host:~$`, `root@x:/#`, `%`, `>`)? A prompt is the strongest "command
+ * finished" signal; without it a slow command (sleep, build, network) can
+ * show two identical frames mid-run.
+ */
+export function looksLikePrompt(lines) {
+  if (!Array.isArray(lines)) return false;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = String(lines[i] ?? "").trimEnd();
+    if (!line.trim()) continue;
+    return /[$#%>]$/.test(line);
+  }
+  return false;
+}
+
 /**
  * Poll `read` (an async () => { ok, lines } reader, e.g. captureWindowText)
- * every ~intervalMs until two consecutive reads are identical (screen settled)
- * or `timeoutMs` elapses. Failed reads are skipped (transient OCR/tool
- * errors do not reset settle progress). Resolves
- * `{ settled, lines, elapsedMs }`; never throws.
+ * every ~intervalMs until the screen has settled or `timeoutMs` elapses.
+ * Settled means: two consecutive identical reads AND either the newest line
+ * is a shell prompt, or the screen has stayed unchanged for `quietMs` (a
+ * long-running command that is silent must not "settle" after 400ms).
+ * When `before` (the pre-command read) is given, a read identical to it never
+ * counts as settled (the command has not even echoed yet). Failed reads are
+ * skipped. Resolves `{ settled, lines, elapsedMs }`; never throws.
  */
-export async function settleTerminal(read, { timeoutMs = 10_000, intervalMs = RUN_TERMINAL_POLL_MS } = {}) {
+export async function settleTerminal(
+  read,
+  { timeoutMs = 10_000, intervalMs = RUN_TERMINAL_POLL_MS, quietMs = RUN_TERMINAL_QUIET_MS, before = null } = {},
+) {
   const started = Date.now();
   let prev = null;
+  let stableSince = 0;
   let lastLines = [];
   while (true) {
     const remaining = timeoutMs - (Date.now() - started);
     if (remaining <= 0) break;
-    const res = await read();
+    let res = null;
+    try {
+      res = await read();
+    } catch {
+      res = null;
+    }
     if (res && res.ok === true && Array.isArray(res.lines)) {
+      const now = Date.now();
       lastLines = res.lines;
-      if (prev !== null && sameLines(prev, res.lines)) {
-        return { settled: true, lines: lastLines, elapsedMs: Date.now() - started };
+      const unchangedFromBefore = Array.isArray(before) && sameLines(before, res.lines);
+      if (prev !== null && sameLines(prev, res.lines) && !unchangedFromBefore) {
+        if (!stableSince) stableSince = now;
+        if (looksLikePrompt(res.lines) || now - stableSince >= quietMs) {
+          return { settled: true, lines: lastLines, elapsedMs: now - started };
+        }
+      } else {
+        stableSince = 0;
       }
       prev = res.lines;
     }

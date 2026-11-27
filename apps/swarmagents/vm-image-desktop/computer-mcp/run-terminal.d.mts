@@ -42,7 +42,7 @@ export interface TerminalReadResult {
 export type TerminalReader = () => Promise<TerminalReadResult> | TerminalReadResult;
 
 export interface SettleTerminalResult {
-  /** True when two consecutive reads were identical before the timeout. */
+  /** True when reads were stable (prompt back, or quiet for quietMs) before the timeout. */
   settled: boolean;
   /** The last successful read's lines (empty when no read ever succeeded). */
   lines: string[];
@@ -50,12 +50,19 @@ export interface SettleTerminalResult {
   elapsedMs: number;
 }
 
+/** Quiet period required when no shell prompt is back yet (ms). */
+export const RUN_TERMINAL_QUIET_MS: number;
+
+/** Does the newest non-empty line look like an idle shell prompt? */
+export function looksLikePrompt(lines: string[]): boolean;
+
 /**
- * Poll `read` every ~intervalMs until two consecutive reads are identical
- * (screen settled) or `timeoutMs` elapses. Failed reads are skipped. Never
- * throws.
+ * Poll `read` every ~intervalMs until the screen settles (two identical reads
+ * with a shell prompt back, or unchanged for `quietMs`) or `timeoutMs`
+ * elapses. A read identical to `before` never settles. Failed reads are
+ * skipped. Never throws.
  */
 export function settleTerminal(
   read: TerminalReader,
-  options?: { timeoutMs?: number; intervalMs?: number },
+  options?: { timeoutMs?: number; intervalMs?: number; quietMs?: number; before?: string[] | null },
 ): Promise<SettleTerminalResult>;

@@ -20,7 +20,7 @@ import {
   parseToolArgs,
   summarizeTool,
 } from "../../vm-image-desktop/computer-mcp/validate.mjs";
-import { diffNewLines, settleTerminal } from "../../vm-image-desktop/computer-mcp/run-terminal.mjs";
+import { diffNewLines, looksLikePrompt, settleTerminal } from "../../vm-image-desktop/computer-mcp/run-terminal.mjs";
 import {
   classifyDesktopToolCall,
   computerActionEvent,
@@ -161,9 +161,53 @@ test("settleTerminal: failed reads are skipped and do not settle", async () => {
     calls++;
     if (calls === 2) return { ok: false, error: "transient OCR failure" };
     return { ok: true, lines: ["$", "ok"] };
-  }, { timeoutMs: 5000, intervalMs: 20 });
+  }, { timeoutMs: 5000, intervalMs: 20, quietMs: 60 });
   assert.equal(res.settled, true, "a transient failure mid-poll does not break settle");
   assert.deepEqual(res.lines, ["$", "ok"]);
+});
+
+test("looksLikePrompt: recognizes idle shell prompts, not output lines", () => {
+  assert.equal(looksLikePrompt(["out", "box@vm:~$ "]), true);
+  assert.equal(looksLikePrompt(["root@vm:/#", "", ""]), true);
+  assert.equal(looksLikePrompt(["box@vm:~$ sleep 5"]), false);
+  assert.equal(looksLikePrompt(["building..."]), false);
+  assert.equal(looksLikePrompt([]), false);
+});
+
+test("settleTerminal: a silent slow command does not settle early without a prompt", async () => {
+  // `sleep 5; echo done`: the echoed command sits unchanged for a while.
+  const started = Date.now();
+  let calls = 0;
+  const res = await settleTerminal(async () => {
+    calls++;
+    return Date.now() - started < 200
+      ? { ok: true, lines: ["box@vm:~$ sleep 5; echo done"] }
+      : { ok: true, lines: ["box@vm:~$ sleep 5; echo done", "done", "box@vm:~$"] };
+  }, { timeoutMs: 5000, intervalMs: 20, quietMs: 1000 });
+  assert.equal(res.settled, true);
+  assert.deepEqual(res.lines, ["box@vm:~$ sleep 5; echo done", "done", "box@vm:~$"]);
+  assert.ok(res.elapsedMs >= 200, `settled only after the output arrived (${res.elapsedMs}ms)`);
+});
+
+test("settleTerminal: stable output without a prompt settles after the quiet period", async () => {
+  const res = await settleTerminal(async () => ({ ok: true, lines: ["$ top -b", "load 0.1"] }), {
+    timeoutMs: 5000,
+    intervalMs: 20,
+    quietMs: 150,
+  });
+  assert.equal(res.settled, true);
+  assert.ok(res.elapsedMs >= 150, `waited the quiet period (${res.elapsedMs}ms)`);
+});
+
+test("settleTerminal: a screen identical to the pre-command read never settles", async () => {
+  const before = ["box@vm:~$"];
+  const res = await settleTerminal(async () => ({ ok: true, lines: before.slice() }), {
+    timeoutMs: 150,
+    intervalMs: 20,
+    quietMs: 10,
+    before,
+  });
+  assert.equal(res.settled, false);
 });
 
 // ---- Harness risk classification -------------------------------------------

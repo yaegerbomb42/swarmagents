@@ -571,8 +571,8 @@ async function runInTerminal(args) {
   const sent = await typeInto({ text: cmdText }, typed.cmds);
   if (sent.isError) return sent;
 
-  // Wait for the screen to settle (two identical reads) or timeout.
-  const settleRes = await settleTerminal(readTerminal, { timeoutMs, intervalMs: 400 });
+  // Wait for the screen to settle (prompt back or quiet period) or timeout.
+  const settleRes = await settleTerminal(readTerminal, { timeoutMs, intervalMs: 400, before: beforeRes.lines });
 
   const fresh = diffNewLines(settleRes.lines, beforeRes.lines);
   const lines = fresh.lines;
@@ -795,7 +795,7 @@ function toolSpec(tool) {
     case "run_in_terminal":
       return {
         description:
-          'Run a command in a visible terminal on the desktop in one call: focus the terminal (the window whose title contains `title`, or the focused window if it is a terminal), type the command (paste mode for long/unicode text), press Return, wait for the screen to settle (two identical reads), and return only the lines that appeared after the command. Prefer this over type + key Return + wait + read_window_text for terminal commands.',
+          'Run a command in a visible terminal on the desktop in one call: focus the terminal (the window whose title contains `title`, or the focused window if it is a terminal), type the command (paste mode for long/unicode text), press Return, wait for the screen to settle (shell prompt back, or output quiet for 3s), and return only the lines that appeared after the command. Prefer this over type + key Return + wait + read_window_text for terminal commands.',
         shape: {
           command: z.string().describe("The command to run (max 20000 chars). Return is pressed automatically."),
           title: z.string().optional().describe("Window title substring of the terminal (default: the focused window if it is a terminal)."),

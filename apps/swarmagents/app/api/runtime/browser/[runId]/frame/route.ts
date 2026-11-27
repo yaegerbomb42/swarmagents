@@ -15,18 +15,11 @@ import { USER_HEADER } from "../../../../../../lib/auth";
 import { RUN_ID_RE } from "../../../../../../lib/telemetry/paths";
 import { getRuntimeManager } from "../../../../../../lib/runtime/manager";
 import { getBrowserManager } from "../../../../../../lib/browser/manager";
-import { isDesktopModeEnabled } from "../../../../../../lib/vm/desktop";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: string }> }) {
-  if (isDesktopModeEnabled()) {
-    return NextResponse.json(
-      { error: "Desktop mode: the agent drives the on-screen browser; headless frame serving is disabled." },
-      { status: 409 },
-    );
-  }
   const user = req.headers.get(USER_HEADER);
   if (!user || user.length > 128) {
     return NextResponse.json({ error: "Sign in required." }, { status: 401 });

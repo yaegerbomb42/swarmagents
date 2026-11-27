@@ -140,7 +140,9 @@ test("scroll maps deltas to wheel-button repeats, capped", () => {
 test("open_app only launches allowlisted apps", () => {
   assert.deepEqual(parseToolArgs("open_app", { name: "browser" }), {
     ok: true,
-    cmds: [["chromium", "--new-window"]],
+    // --remote-debugging-port=9222 opens the CDP debug port so the Browser
+    // tab can mirror this Chromium (l10); plain Chromium accepts the flag.
+    cmds: [["chromium", "--new-window", "--remote-debugging-port=9222"]],
   });
   assert.deepEqual(parseToolArgs("open_app", { name: "terminal" }), {
     ok: true,

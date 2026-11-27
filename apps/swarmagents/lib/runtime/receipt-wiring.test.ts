@@ -71,6 +71,9 @@ class StubBrowser implements BrowserControl {
     return { frameId: 1, jpeg: Buffer.from([0xff, 0xd8, 0xff, 0xe0]), width: 2, height: 2, capturedAt: Date.now() };
   }
   async close(): Promise<void> {}
+  getMode(): "host" {
+    return "host";
+  }
 }
 
 function tmpDir(): string {

@@ -24,6 +24,15 @@
  * The browser process is launched lazily on first use and shared across runs;
  * sessions idle for SESSION_IDLE_MS are closed by the sweeper, and a run's
  * session is closed automatically when the run reaches a terminal state.
+ *
+ * Backends (see ./cdp-endpoint.ts): on a real VM driver the manager mirrors
+ * the Chromium the agent drives inside the user's VM, connecting over CDP
+ * to the per-user endpoint (one browser connection per VM, shared across
+ * that user's runs); the mirrored tab is never closed by this manager —
+ * closing a session only detaches from it. On the fake driver the manager
+ * keeps the historic host-launch behavior, but only behind
+ * SWARM_BROWSER_HOST=1; otherwise there is no browser at all and every
+ * control call fails with BROWSER_IN_VM_MESSAGE.
  */
 
 import { promises as dns } from "node:dns";
@@ -43,6 +52,14 @@ import {
   isPrivateHost,
   parseNavigationUrl,
 } from "./policy";
+import {
+  BROWSER_IN_VM_MESSAGE,
+  CDP_NO_TAB_MESSAGE,
+  createDefaultCdpConnector,
+  resolveBrowserMode,
+  type BrowserMode,
+  type CdpConnector,
+} from "./cdp-endpoint";
 
 /** One captured JPEG frame for a run. */
 export interface BrowserFrame {
@@ -78,6 +95,8 @@ export interface BrowserControl {
   getDiagnostics(runId: string): Promise<BrowserDiagnosticEntry[]>;
   getFrame(runId: string): Promise<BrowserFrame | null>;
   close(runId: string): Promise<void>;
+  /** Which backend serves this run's Browser tab (host / vm / unavailable). */
+  getMode(): BrowserMode;
 }
 
 /** Cap on published frame rate (frames per second). */
@@ -110,6 +129,22 @@ interface RunSession {
   captureInFlight: Promise<BrowserFrame | null> | null;
   /** Console/pageerror/requestfailed entries, newest last, capped at 100. */
   diagnostics: BrowserDiagnosticEntry[];
+  /**
+   * True when this manager owns the context (host-launched Chromium): close()
+   * may close it. False for a CDP-mirrored tab — the context belongs to the
+   * VM's browser and must never be closed from here.
+   */
+  ownsContext: boolean;
+  /** CDP endpoint this session mirrors (vm mode only). */
+  endpoint?: string;
+  /**
+   * Generation bumped whenever the mirrored page switches (a new tab becomes
+   * active) or the session closes; page listeners captured an older
+   * generation ignore their events instead of acting on a stale page.
+   */
+  pageGeneration: number;
+  /** True once close() ran; late page/context events are ignored. */
+  closed: boolean;
 }
 
 /** Append one diagnostic entry, keeping only the newest MAX_DIAGNOSTICS. */
@@ -183,11 +218,22 @@ export class BrowserManager implements BrowserControl {
   /** DNS resolver used by the navigation preflight (injectable in tests). */
   private readonly lookup: (host: string) => Promise<string[]>;
   private readonly sessions = new Map<string, Promise<RunSession>>();
-  private browserPromise: Promise<Browser> | null = null;
+  /** One browser connection per backend endpoint (host launch or CDP URL). */
+  private readonly browsersByEndpoint = new Map<string, Promise<Browser>>();
   /** Cap on concurrent sessions (bounds Chromium context/tab memory). */
   private readonly maxSessions: number;
   /** Chromium launcher (injectable in tests). */
   private readonly launch: (options: Parameters<typeof chromium.launch>[0]) => Promise<Browser>;
+  /** True when the caller injected a launcher (host backend, e.g. in tests). */
+  private readonly launchInjected: boolean;
+  /** CDP connector (injectable in tests); lazily the production default. */
+  private cdp: CdpConnector | null;
+  /** Explicit backend override (tests); otherwise resolved from injections/env. */
+  private readonly explicitMode: BrowserMode | undefined;
+  /** Environment used for backend resolution (injectable in tests). */
+  private readonly env: Readonly<Record<string, string | undefined>>;
+  /** Live host-launched sessions; the host browser closes when this hits 0. */
+  private hostSessionCount = 0;
 
   constructor(
     options: {
@@ -195,44 +241,266 @@ export class BrowserManager implements BrowserControl {
       lookup?: (host: string) => Promise<string[]>;
       maxSessions?: number;
       launch?: (options: Parameters<typeof chromium.launch>[0]) => Promise<Browser>;
+      cdp?: CdpConnector;
+      mode?: BrowserMode;
+      env?: Readonly<Record<string, string | undefined>>;
     } = {},
   ) {
     this.bus = options.bus ?? telemetryBus;
     this.lookup = options.lookup ?? lookupAddresses;
     this.maxSessions = options.maxSessions ?? MAX_SESSIONS;
     this.launch = options.launch ?? ((opts) => chromium.launch(opts));
+    this.launchInjected = options.launch !== undefined;
+    this.cdp = options.cdp ?? null;
+    this.explicitMode = options.mode;
+    this.env = options.env ?? process.env;
+  }
+
+  /**
+   * Which backend this manager uses. An explicit mode wins; an injected CDP
+   * connector means the VM mirror; an injected launcher means the historic
+   * host browser (so existing tests that stub `launch` keep working); the
+   * production default resolves from the environment (see cdp-endpoint).
+   */
+  getMode(): BrowserMode {
+    if (this.explicitMode) return this.explicitMode;
+    if (this.cdp) return "vm";
+    if (this.launchInjected) return "host";
+    return resolveBrowserMode(this.env);
+  }
+
+  private cdpConnector(): CdpConnector {
+    if (!this.cdp) this.cdp = createDefaultCdpConnector();
+    return this.cdp;
+  }
+
+  private browserStartError(error: unknown): string {
+    const detail = error instanceof Error ? error.message : String(error);
+    // The no-browser message is already user-facing; never wrap it.
+    if (detail === BROWSER_IN_VM_MESSAGE) return detail;
+    return this.getMode() === "vm"
+      ? `Could not connect to the VM browser: ${detail}`
+      : `Could not start headless Chromium: ${detail}`;
   }
 
   // --- lifecycle -----------------------------------------------------------
 
-  protected browser(): Promise<Browser> {
-    if (!this.browserPromise) {
-      const pending = this.launch({
-        headless: true,
-        executablePath: executablePath(),
-        // The server runs in a container (often as root, no SUID sandbox);
-        // Chromium cannot start otherwise. The sandbox adds little here: the
-        // browser renders untrusted web content, but it is already isolated
-        // inside this platform and never given host credentials.
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      });
-      // A failed launch (or a mid-run crash/disconnect) must not poison all
-      // later sessions: clear the cached promise so the next call launches a
-      // fresh Chromium instead of reusing the dead one.
+  /** Launch the shared host Chromium (the historic backend). */
+  private launchHost(): Promise<Browser> {
+    return this.launch({
+      headless: true,
+      executablePath: executablePath(),
+      // The server runs in a container (often as root, no SUID sandbox);
+      // Chromium cannot start otherwise. The sandbox adds little here: the
+      // browser renders untrusted web content, but it is already isolated
+      // inside this platform and never given host credentials.
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
+  }
+
+  /**
+   * One cached browser connection per backend endpoint. A failed open (or a
+   * mid-run disconnect) must not poison later sessions: the entry is cleared
+   * so the next call opens a fresh connection instead of reusing the dead one.
+   */
+  protected browserForEndpoint(key: string, open: () => Promise<Browser>): Promise<Browser> {
+    let pending = this.browsersByEndpoint.get(key);
+    if (!pending) {
+      pending = open();
       pending.catch(() => {
-        if (this.browserPromise === pending) this.browserPromise = null;
+        if (this.browsersByEndpoint.get(key) === pending) this.browsersByEndpoint.delete(key);
       });
-      pending.then((browser) => {
-        browser.on("disconnected", () => {
-          if (this.browserPromise === pending) this.browserPromise = null;
-        });
-      }).catch(() => {});
-      this.browserPromise = pending;
+      pending
+        .then((browser) => {
+          browser.on("disconnected", () => {
+            if (this.browsersByEndpoint.get(key) === pending) this.browsersByEndpoint.delete(key);
+          });
+        })
+        .catch(() => {});
+      this.browsersByEndpoint.set(key, pending);
     }
-    return this.browserPromise;
+    return pending;
+  }
+
+  protected browser(): Promise<Browser> {
+    return this.browserForEndpoint("host", () => this.launchHost());
+  }
+
+  /** Resolve the CDP endpoint for a run, or throw a user-facing reason. */
+  private async resolveCdpEndpoint(runId: string): Promise<string> {
+    const endpoint = await this.cdpConnector().endpointForRun(runId);
+    if (!endpoint) {
+      throw new Error("Could not reach the VM browser (no CDP endpoint for this run).");
+    }
+    return endpoint;
+  }
+
+  /**
+   * The mirrored page of a CDP browser: the default context's newest tab.
+   * Polls briefly because the agent may be opening the browser right now;
+   * null when no tab appears in time.
+   */
+  private async waitForMirrorPage(
+    context: BrowserContext,
+    timeoutMs = 2000,
+  ): Promise<Page | null> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const pages = context.pages();
+      const latest = pages[pages.length - 1];
+      if (latest) return latest;
+      if (Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  /**
+   * (Re)attach the mirror listeners to a page: navigation marks the run as
+   * needing a fresh frame and captures one immediately, so the Browser tab
+   * follows the agent's tab within about a second. `generation` is the
+   * session's page generation at attach time; stale listeners no-op.
+   */
+  private attachMirrorListeners(runId: string, session: RunSession, page: Page): void {
+    const generation = session.pageGeneration;
+    const live = () => !session.closed && session.pageGeneration === generation && session.page === page;
+    page.on("framenavigated", () => {
+      if (!live()) return;
+      session.pendingChange = true;
+      session.lastUserActivityAt = Date.now();
+      session.url = page.url();
+      void page
+        .title()
+        .then((title) => {
+          if (live()) session.title = title.slice(0, MAX_TITLE_LEN);
+        })
+        .catch(() => {});
+      busPublish(this.bus, runId, "browser.navigated", { url: page.url(), title: session.title ?? "" });
+      void this.captureFrame(runId, session, true);
+    });
+    page.on("load", () => {
+      if (!live()) return;
+      session.pendingChange = true;
+      session.lastUserActivityAt = Date.now();
+    });
+    page.on("close", () => {
+      if (!live()) return;
+      // The mirrored tab closed; the next capture re-picks the newest tab.
+      session.pendingChange = true;
+    });
+  }
+
+  /**
+   * Switch the mirror to a newly opened tab (the agent's latest tab is the
+   * active one). Old-page listeners go stale via the generation bump.
+   */
+  private async switchMirrorPage(runId: string, session: RunSession, page: Page): Promise<void> {
+    if (session.closed || session.page === page) return;
+    session.pageGeneration += 1;
+    session.page = page;
+    session.url = page.url();
+    session.title = (await page.title().catch(() => "")).slice(0, MAX_TITLE_LEN);
+    session.pendingChange = true;
+    session.lastUserActivityAt = Date.now();
+    this.attachMirrorListeners(runId, session, page);
+    await this.captureFrame(runId, session, true);
+    busPublish(this.bus, runId, "browser.navigated", { url: session.url, title: session.title });
+  }
+
+  /** Re-pick the mirrored page when the current one closed (CDP sessions). */
+  private async refreshMirrorPage(runId: string, session: RunSession): Promise<boolean> {
+    if (session.ownsContext || session.closed) return true;
+    if (!session.page.isClosed()) return true;
+    const context = session.context;
+    const page = await this.waitForMirrorPage(context);
+    if (!page) return false;
+    session.pageGeneration += 1;
+    session.page = page;
+    session.url = page.url();
+    session.title = (await page.title().catch(() => "")).slice(0, MAX_TITLE_LEN);
+    session.pendingChange = true;
+    this.attachMirrorListeners(runId, session, page);
+    return true;
+  }
+
+  /**
+   * Make sure a CDP session's mirrored page is still alive before using it
+   * (a closed tab re-picks the newest one). Host sessions always pass.
+   */
+  private async ensureLivePage(runId: string, session: RunSession): Promise<boolean> {
+    return this.refreshMirrorPage(runId, session);
   }
 
   protected async createSession(runId: string): Promise<RunSession> {
+    const mode = this.getMode();
+    if (mode === "unavailable") throw new Error(BROWSER_IN_VM_MESSAGE);
+    if (mode === "vm") return this.createCdpSession(runId);
+    return this.createHostSession(runId);
+  }
+
+  /**
+   * Attach to the Chromium the agent drives inside the user's VM. The
+   * default context's newest tab is the mirrored page; a new tab opened by
+   * the agent becomes the mirror. The context is NOT owned: closing the
+   * session detaches, it never closes the agent's browser. No request
+   * guards are attached here — the VM browser's traffic is already guarded
+   * in-VM (the loopback policy proxy + the Playwright MCP init-page hook),
+   * and a second route handler on the agent's page could break its browsing;
+   * the navigation policy still applies to every user-initiated navigation
+   * (see navigate()).
+   */
+  protected async createCdpSession(runId: string): Promise<RunSession> {
+    const endpoint = await this.resolveCdpEndpoint(runId);
+    const browser = await this.browserForEndpoint(endpoint, () =>
+      this.cdpConnector().connect(endpoint),
+    );
+    const context = browser.contexts()[0];
+    if (!context) throw new Error(CDP_NO_TAB_MESSAGE);
+    const page = await this.waitForMirrorPage(context);
+    if (!page) throw new Error(CDP_NO_TAB_MESSAGE);
+
+    const session = {
+      context,
+      page,
+      frame: null,
+      frameSeq: 0,
+      url: page.url(),
+      title: (await page.title().catch(() => "")).slice(0, MAX_TITLE_LEN),
+      pendingChange: true,
+      lastUserActivityAt: Date.now(),
+      lastCaptureAt: 0,
+      captureInFlight: null as Promise<BrowserFrame | null> | null,
+      diagnostics: [] as BrowserDiagnosticEntry[],
+      ownsContext: false,
+      endpoint,
+      pageGeneration: 0,
+      closed: false,
+    } as RunSession;
+
+    this.attachMirrorListeners(runId, session, page);
+    this.attachDiagnostics(page, session);
+
+    // A new tab opened by the agent becomes the mirrored page.
+    context.on("page", (newPage: Page) => {
+      void this.switchMirrorPage(runId, session, newPage);
+    });
+
+    // Auto-close when the run ends: detach from the mirror; the VM browser
+    // itself keeps running for the agent.
+    session.unsubscribe = this.bus.subscribe(runId, 0, (event) => {
+      if (event.type === "run.finished" || event.type === "run.error" || event.type === "run.cancelled") {
+        void this.close(runId);
+      }
+    });
+
+    session.heartbeat = setInterval(() => {
+      void this.captureFrame(runId, session, false);
+    }, FRAME_HEARTBEAT_MS);
+    session.heartbeat.unref?.();
+
+    return session;
+  }
+
+  protected async createHostSession(runId: string): Promise<RunSession> {
     const browser = await this.browser();
     const context = await browser.newContext({ viewport: DEFAULT_VIEWPORT });
     const page = await context.newPage();
@@ -246,6 +514,9 @@ export class BrowserManager implements BrowserControl {
       lastCaptureAt: 0,
       captureInFlight: null as Promise<BrowserFrame | null> | null,
       diagnostics: [] as BrowserDiagnosticEntry[],
+      ownsContext: true,
+      pageGeneration: 0,
+      closed: false,
     } as RunSession;
 
     // Any browser activity marks the run as needing a fresh frame.
@@ -273,6 +544,7 @@ export class BrowserManager implements BrowserControl {
     }, FRAME_HEARTBEAT_MS);
     session.heartbeat.unref?.();
 
+    this.hostSessionCount += 1;
     return session;
   }
 
@@ -359,7 +631,10 @@ export class BrowserManager implements BrowserControl {
 
   /**
    * Close a run's browser session. Swallows errors (the browser may already be
-   * closed) and always clears the session map entry.
+   * closed) and always clears the session map entry. A CDP session only
+   * detaches from the VM browser — the context and browser belong to the
+   * agent's VM and are never closed from here. The shared host browser is
+   * closed only when the last host session goes away.
    */
   async close(runId: string): Promise<void> {
     const pending = this.sessions.get(runId);
@@ -369,14 +644,21 @@ export class BrowserManager implements BrowserControl {
       const session = await pending;
       clearInterval(session.heartbeat);
       session.unsubscribe();
-      await session.context.close().catch(() => {});
+      session.closed = true;
+      session.pageGeneration += 1;
+      if (session.ownsContext) {
+        this.hostSessionCount = Math.max(0, this.hostSessionCount - 1);
+        await session.context.close().catch(() => {});
+      }
     } catch {
       // Session creation itself failed; nothing to tear down.
     }
-    if (this.sessions.size === 0 && this.browserPromise) {
-      const browserPromise = this.browserPromise;
-      this.browserPromise = null;
-      await browserPromise.then((browser) => browser.close()).catch(() => {});
+    if (this.hostSessionCount === 0) {
+      const hostBrowser = this.browsersByEndpoint.get("host");
+      if (hostBrowser) {
+        this.browsersByEndpoint.delete("host");
+        await hostBrowser.then((browser) => browser.close()).catch(() => {});
+      }
     }
   }
 
@@ -422,7 +704,10 @@ export class BrowserManager implements BrowserControl {
     try {
       session = await this.ensureSession(runId);
     } catch (error) {
-      return fail(`Could not start headless Chromium: ${error instanceof Error ? error.message : String(error)}`);
+      return fail(this.browserStartError(error));
+    }
+    if (!(await this.ensureLivePage(runId, session))) {
+      return fail(CDP_NO_TAB_MESSAGE);
     }
 
     try {
@@ -461,7 +746,12 @@ export class BrowserManager implements BrowserControl {
     try {
       session = await this.ensureSession(runId);
     } catch (error) {
-      const reason = `Could not start headless Chromium: ${error instanceof Error ? error.message : String(error)}`;
+      const reason = this.browserStartError(error);
+      busPublish(this.bus, runId, "browser.error", { action: "screenshot", reason });
+      return { ok: false, reason };
+    }
+    if (!(await this.ensureLivePage(runId, session))) {
+      const reason = CDP_NO_TAB_MESSAGE;
       busPublish(this.bus, runId, "browser.error", { action: "screenshot", reason });
       return { ok: false, reason };
     }
@@ -492,7 +782,11 @@ export class BrowserManager implements BrowserControl {
     try {
       session = await this.ensureSession(runId);
     } catch (error) {
-      return fail(`Could not start headless Chromium: ${error instanceof Error ? error.message : String(error)}`);
+      return fail(this.browserStartError(error));
+    }
+
+    if (!(await this.ensureLivePage(runId, session))) {
+      return fail(CDP_NO_TAB_MESSAGE);
     }
 
     const before = await this.verifyCurrentUrl(session);
@@ -529,7 +823,11 @@ export class BrowserManager implements BrowserControl {
     try {
       session = await this.ensureSession(runId);
     } catch (error) {
-      return fail(`Could not start headless Chromium: ${error instanceof Error ? error.message : String(error)}`);
+      return fail(this.browserStartError(error));
+    }
+
+    if (!(await this.ensureLivePage(runId, session))) {
+      return fail(CDP_NO_TAB_MESSAGE);
     }
 
     const before = await this.verifyCurrentUrl(session);

@@ -73,6 +73,8 @@ import {
 import {
   PLAYWRIGHT_LAUNCHER_PATH,
   PLAYWRIGHT_LAUNCHER_SOURCE,
+  PLAYWRIGHT_MCP_CONFIG_PATH,
+  PLAYWRIGHT_MCP_CONFIG_SOURCE,
   PLAYWRIGHT_POLICY_PATH,
   PLAYWRIGHT_POLICY_SOURCE,
   PLAYWRIGHT_PROXY_PATH,
@@ -195,7 +197,10 @@ export function desktopMcpServerEntry(
       // The launcher also starts the loopback network-policy proxy.
       // The browser profile is the persistent one on the /workspace volume,
       // shared with the desktop Chromium, so logins survive hibernation.
-      args: [PLAYWRIGHT_LAUNCHER_PATH, "--browser", "chromium", "--executable-path", "/usr/bin/chromium", "--user-data-dir", VM_BROWSER_PROFILE_PATH, "--no-sandbox", "--init-page", PLAYWRIGHT_POLICY_PATH],
+      // --config opens the CDP debug port (9222) on this browser so the
+      // Browser tab can mirror it; the flag cannot go on the command line
+      // (the playwright-mcp CLI rejects unknown flags).
+      args: [PLAYWRIGHT_LAUNCHER_PATH, "--browser", "chromium", "--executable-path", "/usr/bin/chromium", "--user-data-dir", VM_BROWSER_PROFILE_PATH, "--no-sandbox", "--init-page", PLAYWRIGHT_POLICY_PATH, "--config", PLAYWRIGHT_MCP_CONFIG_PATH],
       env: { DISPLAY: ":1" },
     };
   }
@@ -541,6 +546,10 @@ export function roleSeedFiles(
     { path: PLAYWRIGHT_POLICY_PATH, content: PLAYWRIGHT_POLICY_SOURCE },
     { path: PLAYWRIGHT_PROXY_PATH, content: PLAYWRIGHT_PROXY_SOURCE },
     { path: PLAYWRIGHT_LAUNCHER_PATH, content: PLAYWRIGHT_LAUNCHER_SOURCE },
+    // The headed Playwright MCP config (CDP debug port for the Browser tab
+    // mirror). Seeded unconditionally like the launcher: the config is inert
+    // unless the headed entry passes --config.
+    { path: PLAYWRIGHT_MCP_CONFIG_PATH, content: PLAYWRIGHT_MCP_CONFIG_SOURCE },
     { path: ROLE_CATALOG_PATH, content: roleCatalogJson(catalog) },
     { path: CODEBASE_MCP_SERVER_PATH, content: codebaseMcpServerSource() },
     // Seeded unconditionally (like the codebase server): the file is inert

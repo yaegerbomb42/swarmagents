@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { NextRequest } from "next/server";
 import { GET, POST } from "./route";
 import { GET as GET_FRAME } from "./frame/route";
+import { GET as GET_MODE } from "./mode/route";
 import { setBrowserManagerForTesting, type BrowserControl, type BrowserFrame } from "../../../../../lib/browser/manager";
 import { checkNavigation } from "../../../../../lib/browser/policy";
 import { setRuntimeManagerForTesting, RuntimeManager } from "../../../../../lib/runtime/manager";
@@ -48,6 +49,11 @@ class StubBrowser implements BrowserControl {
   navigations: Array<{ runId: string; url: string }> = [];
   screenshots = 0;
   frame: BrowserFrame | null = null;
+  mode: "host" | "vm" | "unavailable" = "host";
+
+  getMode(): "host" | "vm" | "unavailable" {
+    return this.mode;
+  }
 
   async navigate(runId: string, url: string) {
     const check = checkNavigation(url);
@@ -157,4 +163,23 @@ test("GET frame returns the latest JPEG with no-store caching", async () => {
   const frameRes = await GET_FRAME(request(`/api/runtime/browser/${RUN}/frame`), { params: Promise.resolve({ runId: RUN }) });
   assert.equal(frameRes.status, 200);
   assert.deepEqual(Buffer.from(await frameRes.arrayBuffer()), JPEG);
+});
+
+test("GET mode reports the browser backend and gates on ownership", async () => {
+  const mode = async (user: string | null = USER) => {
+    const res = await GET_MODE(request(`/api/runtime/browser/${RUN}/mode`, {}, user), {
+      params: Promise.resolve({ runId: RUN }),
+    });
+    return { status: res.status, body: (await res.json().catch(() => null)) as { mode?: string } | null };
+  };
+
+  assert.equal((await mode(null)).status, 401, "unauthenticated");
+  assert.equal((await mode("mallory")).status, 404, "a run the user does not own");
+  assert.deepEqual(await mode(), { status: 200, body: { mode: "host" } });
+
+  stub.mode = "vm";
+  assert.deepEqual(await mode(), { status: 200, body: { mode: "vm" } });
+
+  stub.mode = "unavailable";
+  assert.deepEqual(await mode(), { status: 200, body: { mode: "unavailable" } });
 });

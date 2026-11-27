@@ -87,6 +87,7 @@ RUN apt-get update \
         xdotool \
         xclip \
         scrot \
+        socat \
         tesseract-ocr \
         imagemagick \
         wmctrl \

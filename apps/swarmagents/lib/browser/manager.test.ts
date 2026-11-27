@@ -32,6 +32,8 @@ interface FakePageState {
   screenshotDelayMs?: number;
   /** Locator calls recorded by the fake page. */
   locatorCalls: Array<{ selector: string; method: string; args: unknown[] }>;
+  /** True once the fake page is "closed" (CDP tab-close tests). */
+  closed?: boolean;
 }
 
 type FakeRouteHandler = (
@@ -103,6 +105,7 @@ function fakePage(initial: Partial<FakePageState> & { redirectTo?: string } = {}
       (state.handlers[event] ??= []).push(handler);
     },
     off: () => {},
+    isClosed: () => Boolean(state.closed),
     route: (pattern: string, handler: FakeRouteHandler) => {
       state.routePattern = pattern;
       state.routeHandler = handler;
@@ -134,6 +137,10 @@ interface SessionLike {
   unsubscribe: () => void;
   captureInFlight: Promise<BrowserFrame | null> | null;
   diagnostics: BrowserDiagnosticEntry[];
+  ownsContext: boolean;
+  endpoint?: string;
+  pageGeneration: number;
+  closed: boolean;
 }
 
 class FakeBrowserManager extends BrowserManager {
@@ -167,6 +174,9 @@ function makeSession(page: Page, context?: BrowserContext): SessionLike {
     unsubscribe: () => {},
     captureInFlight: null,
     diagnostics: [],
+    ownsContext: true,
+    pageGeneration: 0,
+    closed: false,
   };
 }
 
@@ -600,4 +610,203 @@ test("a mid-run browser disconnect does not poison later sessions", async () => 
   assert.equal(manager.launcherCalls, 2, "disconnect must clear the cached launch");
   assert.equal(browserB, second as unknown as Browser);
   await manager.close("run_nonexistent");
+});
+
+/** ---- CDP mirror (l10) -------------------------------------------------- */
+
+const CDP_URL = "http://172.18.0.4:9223";
+
+interface FakeCdpContextState {
+  pages: Page[];
+  contextClosed: boolean;
+  pageHandlers: Record<string, Array<(page: Page) => void>>;
+}
+
+/** A fake CDP browser: contexts() returns the VM's existing contexts. */
+function fakeCdpBrowser(context: BrowserContext, state: { browserClosed: boolean }) {
+  return {
+    contexts: () => [context],
+    on: () => {},
+    close: async () => {
+      state.browserClosed = true;
+    },
+  } as unknown as Browser;
+}
+
+function fakeCdpContext(pages: Page[]): { context: BrowserContext; state: FakeCdpContextState } {
+  const state: FakeCdpContextState = { pages: [...pages], contextClosed: false, pageHandlers: {} };
+  const context = {
+    pages: () => [...state.pages],
+    newPage: async () => pages[pages.length - 1]!,
+    on: (event: string, handler: (page: Page) => void) => {
+      (state.pageHandlers[event] ??= []).push(handler);
+    },
+    close: async () => {
+      state.contextClosed = true;
+    },
+  } as unknown as BrowserContext;
+  return { context, state };
+}
+
+/** Fire a recorded event handler on a fake page. */
+function firePage(state: FakePageState, event: string): void {
+  for (const handler of state.handlers[event] ?? []) handler(undefined as never);
+}
+
+/** BrowserManager wired to a stub CDP connector (no VM needed). */
+class CdpBrowserManager extends BrowserManager {
+  connectCalls: string[] = [];
+  constructor(
+    browser: Browser,
+    endpointForRun: (runId: string) => Promise<string | null> = async () => CDP_URL,
+  ) {
+    super({
+      bus: telemetryBus,
+      cdp: {
+        connect: async (endpoint: string) => {
+          this.connectCalls.push(endpoint);
+          return browser;
+        },
+        endpointForRun,
+      },
+    });
+  }
+}
+
+test("CDP mirror: navigate drives the agent's tab and the frame follows it", async () => {
+  const { page, state } = fakePage({ url: "https://agent.example/start", title: "Agent Page" });
+  const { context } = fakeCdpContext([page]);
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }));
+  const events = eventsOf(RUN);
+
+  const result = await manager.navigate(RUN, "https://example.com/next");
+  assert.equal(result.ok, true);
+  assert.deepEqual(state.gotoCalls, ["https://example.com/next"]);
+  assert.equal(state.screenshotCalls, 1, "navigation captures a frame of the mirrored tab");
+  assert.ok(events.some((e) => e.type === "browser.navigated"), "navigation publishes browser.navigated");
+  await manager.close(RUN);
+});
+
+test("CDP mirror: the agent navigating fires framenavigated and the tab follows within a capture", async () => {
+  const { page, state } = fakePage({ url: "https://agent.example/a", title: "Page A" });
+  const { context } = fakeCdpContext([page]);
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }));
+  const events = eventsOf(RUN);
+
+  // First navigate attaches the mirror session.
+  assert.equal((await manager.navigate(RUN, "https://agent.example/a")).ok, true);
+  const framesBefore = state.screenshotCalls;
+
+  // The agent navigates its own tab (via MCP, not through this manager).
+  state.url = "https://agent.example/b";
+  state.title = "Page B";
+  firePage(state, "framenavigated");
+
+  // The listener is async (title + capture); let it settle.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(state.screenshotCalls > framesBefore, "agent navigation triggers a fresh frame capture");
+  assert.ok(
+    events.some(
+      (e) =>
+        e.type === "browser.navigated" &&
+        (e.data as { url?: string }).url === "https://agent.example/b",
+    ),
+    "agent navigation publishes browser.navigated with the new URL",
+  );
+  await manager.close(RUN);
+});
+
+test("CDP mirror: a newly opened tab becomes the mirrored page", async () => {
+  const first = fakePage({ url: "https://agent.example/first", title: "First" });
+  const second = fakePage({ url: "https://agent.example/second", title: "Second" });
+  const { context, state: ctxState } = fakeCdpContext([first.page]);
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }));
+
+  assert.equal((await manager.navigate(RUN, "https://agent.example/first")).ok, true);
+  assert.deepEqual(first.state.gotoCalls, ["https://agent.example/first"]);
+
+  // The agent opens a new tab; the context reports it.
+  ctxState.pages.push(second.page);
+  for (const handler of ctxState.pageHandlers["page"] ?? []) handler(second.page);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  // The next user navigation drives the new tab, not the old one.
+  const result = await manager.navigate(RUN, "https://example.com/elsewhere");
+  assert.equal(result.ok, true);
+  assert.deepEqual(second.state.gotoCalls, ["https://example.com/elsewhere"]);
+  assert.deepEqual(first.state.gotoCalls, ["https://agent.example/first"]);
+  await manager.close(RUN);
+});
+
+test("CDP mirror: closing a session detaches without closing the VM browser", async () => {
+  const { page } = fakePage({ url: "https://agent.example/a" });
+  const { context, state: ctxState } = fakeCdpContext([page]);
+  const browserState = { browserClosed: false };
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, browserState));
+
+  assert.equal((await manager.navigate(RUN, "https://agent.example/a")).ok, true);
+  await manager.close(RUN);
+  assert.equal(ctxState.contextClosed, false, "the mirrored context must survive close()");
+  assert.equal(browserState.browserClosed, false, "the VM browser must survive close()");
+});
+
+test("CDP mirror: a closed tab re-picks the newest tab on the next call", async () => {
+  const first = fakePage({ url: "https://agent.example/old", title: "Old" });
+  const second = fakePage({ url: "https://agent.example/new", title: "New" });
+  const { context, state: ctxState } = fakeCdpContext([first.page, second.page]);
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }));
+
+  assert.equal((await manager.navigate(RUN, "https://agent.example/old")).ok, true);
+  // The mirrored page (the newest tab, `second`) closes; the context still
+  // lists both pages, so the re-pick lands on the surviving one.
+  second.state.closed = true;
+  ctxState.pages = [first.page];
+  const result = await manager.navigate(RUN, "https://example.com/again");
+  assert.equal(result.ok, true);
+  assert.deepEqual(first.state.gotoCalls, ["https://example.com/again"]);
+  await manager.close(RUN);
+});
+
+test("CDP mirror: no open tab fails with a clear reason instead of hanging", async () => {
+  const { context } = fakeCdpContext([]);
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }));
+  const result = await manager.navigate(RUN, "https://example.com/");
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /no open tab/);
+  await manager.close(RUN);
+});
+
+test("CDP mirror: an unresolvable endpoint fails with a clear reason", async () => {
+  const { page } = fakePage();
+  const { context } = fakeCdpContext([page]);
+  const manager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }), async () => null);
+  const result = await manager.navigate(RUN, "https://example.com/");
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /Could not reach the VM browser/);
+  assert.deepEqual(manager.connectCalls, [], "no CDP connection is attempted without an endpoint");
+  await manager.close(RUN);
+});
+
+test("unavailable mode: every control call fails with the Screen-tab message", async () => {
+  const manager = new BrowserManager({ bus: telemetryBus, mode: "unavailable" });
+  assert.equal(manager.getMode(), "unavailable");
+  const result = await manager.navigate(RUN, "https://example.com/");
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "Browser runs inside your computer — open the Screen tab");
+  assert.equal((await manager.screenshot(RUN)).ok, false);
+  await manager.close(RUN);
+});
+
+test("getMode: an injected CDP connector means vm, an injected launcher means host", () => {
+  const { page } = fakePage();
+  const { context } = fakeCdpContext([page]);
+  const cdpManager = new CdpBrowserManager(fakeCdpBrowser(context, { browserClosed: false }));
+  assert.equal(cdpManager.getMode(), "vm");
+  const hostManager = new BrowserManager({
+    bus: telemetryBus,
+    launch: async () => ({}) as unknown as Browser,
+  });
+  assert.equal(hostManager.getMode(), "host");
+  const explicit = new BrowserManager({ bus: telemetryBus, mode: "host" });
+  assert.equal(explicit.getMode(), "host");
 });

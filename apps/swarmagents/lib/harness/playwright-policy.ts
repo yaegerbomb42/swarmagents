@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { CDP_DEBUG_PORT } from "../browser/cdp-endpoint";
 
 /** Network endpoint shared by Playwright MCP processes inside one VM. */
 export const PLAYWRIGHT_PROXY_ORIGIN = "http://127.0.0.1:18793";
@@ -7,6 +8,35 @@ export const PLAYWRIGHT_LAUNCHER_PATH = "/workspace/.swarm/playwright-mcp-launch
 
 /** Path of the Playwright MCP per-page request guard inside the VM. */
 export const PLAYWRIGHT_POLICY_PATH = "/workspace/.swarm/playwright-policy.cjs";
+
+/**
+ * Path of the Playwright MCP config file inside the VM. It carries the one
+ * browser-launch option the CLI cannot: `--remote-debugging-port=9222`, so
+ * the Browser tab can mirror the agent's Chromium over CDP (see
+ * lib/browser/cdp-endpoint.ts). The CLI rejects unknown flags outright
+ * (verified against @playwright/mcp@0.0.85, the version pinned in the
+ * desktop image: `error: unknown option '--remote-debugging-port=9222'`),
+ * and it has no --browser-arg flag — but a config file's
+ * browser.launchOptions.args is merged into the launch options and honored
+ * by the server (validateBrowserConfig keeps `args`, appending only
+ * --disable-blink-features=AutomationControlled). The headless entry does
+ * NOT use this config: each headless run launches its own ephemeral
+ * Chromium, and every one of them would contend for port 9222.
+ */
+export const PLAYWRIGHT_MCP_CONFIG_PATH = "/workspace/.swarm/playwright-mcp.config.json";
+
+/** Playwright MCP config: open the CDP debug port on the headed browser. */
+export const PLAYWRIGHT_MCP_CONFIG_SOURCE = JSON.stringify(
+  {
+    browser: {
+      launchOptions: {
+        args: [`--remote-debugging-port=${CDP_DEBUG_PORT}`],
+      },
+    },
+  },
+  null,
+  2,
+);
 
 /**
  * Request guard loaded by Playwright MCP's --init-page hook for every tab.

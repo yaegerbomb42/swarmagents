@@ -62,6 +62,9 @@ class StubBrowser implements BrowserControl {
     throw new Error("not used");
   }
   async close(): Promise<void> {}
+  getMode(): "host" {
+    return "host";
+  }
 }
 
 function tmpDir(): string {

@@ -810,3 +810,70 @@ test("getMode: an injected CDP connector means vm, an injected launcher means ho
   const explicit = new BrowserManager({ bus: telemetryBus, mode: "host" });
   assert.equal(explicit.getMode(), "host");
 });
+
+test("close() does not close the shared host browser while a concurrent navigate() is creating a session", async () => {
+  let browserClosed = false;
+  let releaseRun1Close!: () => void;
+  const run1CloseGate = new Promise<void>((r) => {
+    releaseRun1Close = r;
+  });
+  let releaseRun2Context!: () => void;
+  const run2ContextGate = new Promise<void>((r) => {
+    releaseRun2Context = r;
+  });
+
+  let ctxIndex = 0;
+  const fakeBrowser = {
+    on: () => {},
+    close: async () => {
+      browserClosed = true;
+    },
+    newContext: async () => {
+      ctxIndex += 1;
+      const idx = ctxIndex;
+      if (idx === 2) {
+        await run2ContextGate;
+      }
+      if (browserClosed) {
+        throw new Error("Target page, context or browser has been closed");
+      }
+      const { page } = fakePage({ url: PUBLIC_URL });
+      return {
+        newPage: async () => page,
+        close: async () => {
+          if (idx === 1) await run1CloseGate;
+        },
+      };
+    },
+  } as unknown as Browser;
+
+  const manager = new BrowserManager({
+    bus: telemetryBus,
+    launch: async () => fakeBrowser,
+    lookup: async () => ["93.184.216.34"],
+  });
+
+  // Start run_1 so the shared host browser is launched and hostSessionCount === 1.
+  const nav1 = await manager.navigate("run_1", PUBLIC_URL);
+  assert.equal(nav1.ok, true);
+
+  // Start closing run_1; it blocks awaiting run_1's context.close().
+  const close1 = manager.close("run_1");
+  // Concurrently start run_2; it enters createHostSession() and blocks awaiting newContext().
+  const nav2Promise = manager.navigate("run_2", PUBLIC_URL);
+
+  // Finish closing run_1 while run_2 is still creating its context.
+  releaseRun1Close();
+  await close1;
+  assert.equal(browserClosed, false, "shared host browser must stay open while run_2 is creating");
+
+  // Finish creating run_2's context and verify navigate succeeds.
+  releaseRun2Context();
+  const nav2 = await nav2Promise;
+  assert.equal(nav2.ok, true, "concurrent navigate must not fail with browser-closed");
+  assert.equal(browserClosed, false);
+
+  // Once run_2 closes and nothing else is pending, the shared host browser closes.
+  await manager.close("run_2");
+  assert.equal(browserClosed, true);
+});

@@ -546,6 +546,9 @@ const SCHEMA_META_KEYWORDS = [
   "$comment",
   "$defs",
   "definitions",
+  // Only unresolvable refs survive to this point: local ones are inlined by
+  // inlineLocalRefs first, so dropping the key never orphans a real schema.
+  "$ref",
   "$recursiveRef",
   "$dynamicRef",
 ] as const;
@@ -570,11 +573,11 @@ const OPENAI_FORMATS = new Set([
 /** Gemini's documented `format` support for strings. */
 const GEMINI_FORMATS = new Set(["enum", "date-time"]);
 
-/** Long tool descriptions (Claude Code emits some >10k chars) hit provider limits. */
-const MAX_DESCRIPTION_CHARS = 500;
-
-/** Several strict dialects cap object property counts far below JSON Schema's. */
-const MAX_PROPERTIES = 64;
+/**
+ * Very long tool descriptions (Claude Code emits some >10k chars) hit
+ * provider limits; ordinary parameter docs stay whole.
+ */
+const MAX_DESCRIPTION_CHARS = 2000;
 
 /** Guard against pathologically nested schemas; deeper subtrees become `{}`. */
 const MAX_SCHEMA_DEPTH = 16;
@@ -621,15 +624,68 @@ function allowedFormats(dialect: SchemaDialect): Set<string> | undefined {
  *     {"type":"null"} branch) into the dialect's null representation:
  *     a `type` array on the OpenAI wire, `nullable: true` on Gemini, and a
  *     dropped null variant on Ollama (whose grammar has no null);
- *   - caps description length and object property count (first N win, and
- *     `required` is filtered to the survivors);
+ *   - inlines local `$ref`s (before `$defs` is stripped), cycle-safe;
+ *   - caps very long descriptions (never drops properties);
  *   - caps recursion depth; deeper subtrees become a permissive `{}`.
  *
  * Pure and non-mutating; best-effort by design — the output is always a
  * usable schema-like object and never throws.
  */
 export function sanitizeToolJsonSchema(schema: unknown, dialect: SchemaDialect): unknown {
-  return sanitizeSchemaNode(schema, dialect, 0);
+  return sanitizeSchemaNode(inlineLocalRefs(schema), dialect, 0);
+}
+
+/** Resolve a local JSON pointer ("#/$defs/Foo", "#/definitions/a~1b") against the root. */
+function resolveLocalPointer(root: unknown, ref: string): unknown {
+  if (ref === "#") return root;
+  if (!ref.startsWith("#/")) return undefined;
+  let cur: unknown = root;
+  for (const raw of ref.slice(2).split("/")) {
+    const seg = decodeURIComponent(raw).replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(cur)) cur = cur[Number(seg)];
+    else if (isRecord(cur)) cur = cur[seg];
+    else return undefined;
+    if (cur === undefined) return undefined;
+  }
+  return cur;
+}
+
+/**
+ * Inline local `$ref`s (pydantic / zod-to-json-schema emit `{"$ref":
+ * "#/$defs/Foo"}` with a top-level `$defs`). The sanitizer strips `$defs`
+ * for every dialect, so refs must be resolved first or they would point at
+ * nothing and the upstream rejects (or the model cannot fill) the schema.
+ * Sibling keywords next to a `$ref` (e.g. description) win over the target.
+ * A recursive ref becomes a permissive `{}` (keeping siblings); a remote or
+ * unresolvable ref is left for the meta-keyword strip. Pure.
+ */
+function inlineLocalRefs(root: unknown): unknown {
+  const walk = (node: unknown, stack: ReadonlySet<string>, depth: number): unknown => {
+    if (depth > MAX_SCHEMA_DEPTH * 2) return {};
+    if (Array.isArray(node)) return node.map((n) => walk(n, stack, depth + 1));
+    if (!isRecord(node)) return node;
+    const ref = node.$ref;
+    if (typeof ref === "string" && ref.startsWith("#")) {
+      const { $ref: _ref, ...siblings } = node;
+      void _ref;
+      const target = stack.has(ref) ? undefined : resolveLocalPointer(root, ref);
+      if (!isRecord(target)) {
+        // Cycle or dangling pointer: keep what the siblings say, nothing more.
+        return walk(siblings, stack, depth + 1);
+      }
+      const next = new Set(stack);
+      next.add(ref);
+      const resolved = walk(target, next, depth + 1) as Record<string, unknown>;
+      return { ...resolved, ...(walk(siblings, stack, depth + 1) as Record<string, unknown>) };
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node)) {
+      // Definitions are only reachable through refs; they are dropped later.
+      out[key] = key === "$defs" || key === "definitions" ? value : walk(value, stack, depth + 1);
+    }
+    return out;
+  };
+  return walk(root, new Set(), 0);
 }
 
 function sanitizeSchemaNode(node: unknown, dialect: SchemaDialect, depth: number): unknown {
@@ -689,17 +745,13 @@ function sanitizeSchemaNode(node: unknown, dialect: SchemaDialect, depth: number
 
   const props = out.properties;
   if (isRecord(props)) {
+    // Never drop properties: a capped list silently removes real (even
+    // required) arguments the model could then never send.
     const kept: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(props)) {
-      if (Object.keys(kept).length >= MAX_PROPERTIES) break;
       kept[key] = sanitizeSchemaNode(value, dialect, depth + 1);
     }
     out.properties = kept;
-    if (Object.keys(kept).length < Object.keys(props).length && Array.isArray(out.required)) {
-      const required = out.required.filter((r) => typeof r === "string" && r in kept);
-      if (required.length > 0) out.required = required;
-      else delete out.required;
-    }
   }
 
   if (out.items !== undefined) out.items = sanitizeSchemaNode(out.items, dialect, depth + 1);
@@ -715,7 +767,56 @@ function sanitizeSchemaNode(node: unknown, dialect: SchemaDialect, depth: number
   if (isRecord(out.not)) out.not = sanitizeSchemaNode(out.not, dialect, depth + 1);
   if (isRecord(out.contains)) out.contains = sanitizeSchemaNode(out.contains, dialect, depth + 1);
 
+  if (dialect === "gemini") return geminiSchemaSubset(out);
   return out;
+}
+
+/**
+ * Gemini `functionDeclarations[].parameters` is an OpenAPI 3.0 subset and
+ * rejects unknown fields with HTTP 400 ("Unknown name additionalProperties")
+ * - and every Claude Code tool schema carries `additionalProperties: false`.
+ * Keep only the documented fields; map oneOf -> anyOf and a single-branch
+ * allOf into its parent first.
+ */
+const GEMINI_SCHEMA_FIELDS = new Set([
+  "type",
+  "format",
+  "title",
+  "description",
+  "nullable",
+  "enum",
+  "items",
+  "minItems",
+  "maxItems",
+  "properties",
+  "required",
+  "minProperties",
+  "maxProperties",
+  "propertyOrdering",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "minimum",
+  "maximum",
+  "anyOf",
+]);
+
+function geminiSchemaSubset(node: Record<string, unknown>): Record<string, unknown> {
+  let out = node;
+  if (Array.isArray(out.allOf) && out.allOf.length === 1 && isRecord(out.allOf[0])) {
+    const { allOf: _allOf, ...rest } = out;
+    void _allOf;
+    out = { ...(out.allOf[0] as Record<string, unknown>), ...rest };
+  }
+  if (Array.isArray(out.oneOf) && out.anyOf === undefined) {
+    const { oneOf, ...rest } = out;
+    out = { ...rest, anyOf: oneOf };
+  }
+  const kept: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(out)) {
+    if (GEMINI_SCHEMA_FIELDS.has(key)) kept[key] = value;
+  }
+  return kept;
 }
 
 /** Anthropic tools array -> OpenAI tools (functions). */

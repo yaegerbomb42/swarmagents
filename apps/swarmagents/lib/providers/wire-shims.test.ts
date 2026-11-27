@@ -669,7 +669,7 @@ const richClaudeSchema = () => ({
   $id: "tool://read/input",
   type: "object",
   properties: {
-    path: { anyOf: [{ type: "string" }, { type: "null" }], description: "p".repeat(600) },
+    path: { anyOf: [{ type: "string" }, { type: "null" }], description: "p".repeat(2600) },
     mode: { type: "string", format: "uint8", default: "text" },
   },
   required: ["path"],
@@ -693,7 +693,7 @@ test("anthropicToResponses sanitizes tool parameters for the Responses wire", ()
   assert.equal(props.path.type instanceof Array, true);
   assert.equal("format" in props.mode, false);
   assert.equal(props.mode.default, "text");
-  assert.equal((props.path.description as string).length, 500);
+  assert.equal((props.path.description as string).length, 2000);
 });
 
 test("anthropicToOllama sanitizes tool parameters for llama.cpp", () => {
@@ -707,7 +707,7 @@ test("anthropicToOllama sanitizes tool parameters for llama.cpp", () => {
   assert.deepEqual(props.path.type, "string");
   assert.equal("format" in props.mode, false);
   assert.equal("default" in props.mode, false);
-  assert.equal((props.path.description as string).length, 500);
+  assert.equal((props.path.description as string).length, 2000);
 });
 
 test("anthropicToGemini sanitizes function declarations for generateContent", () => {
@@ -720,7 +720,7 @@ test("anthropicToGemini sanitizes function declarations for generateContent", ()
   const props = parameters.properties as Record<string, Record<string, unknown>>;
   // Gemini: nullable marker instead of a null variant, formats limited to its
   // documented set, default/examples stripped.
-  assert.deepEqual(props.path, { type: "string", nullable: true, description: "p".repeat(500) });
+  assert.deepEqual(props.path, { type: "string", nullable: true, description: "p".repeat(2000) });
   assert.equal("format" in props.mode, false);
   assert.equal("default" in props.mode, false);
 });

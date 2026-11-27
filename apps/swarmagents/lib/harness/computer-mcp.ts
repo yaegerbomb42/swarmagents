@@ -174,7 +174,7 @@ export function classifyDesktopToolCall(
   if (info.server === COMPUTER_MCP_SERVER) {
     const parsed = parseToolArgs(info.tool, args);
     if (!parsed.ok) {
-      return { level: "deny", reason: `invalid desktop action: ${parsed.error}` };
+      return { level: "deny", reason: `invalid desktop action: ${parsed.error}`, malformed: true };
     }
     return { level: "allow", reason: "desktop input action" };
   }
@@ -223,7 +223,7 @@ export async function classifyDesktopToolCallAsync(
   if (info.server === COMPUTER_MCP_SERVER) {
     const parsed = parseToolArgs(info.tool, args);
     if (!parsed.ok) {
-      return { level: "deny", reason: `invalid desktop action: ${parsed.error}` };
+      return { level: "deny", reason: `invalid desktop action: ${parsed.error}`, malformed: true };
     }
     return { level: "allow", reason: "desktop input action" };
   }

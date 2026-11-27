@@ -28,6 +28,7 @@
  */
 
 import type { RunStreamItem } from "./useRunStream";
+import { parseEffectLine, type ActionEffect } from "./effect";
 
 /** What the run itself is doing, in the same vocabulary as runPhase.ts. */
 export type PresenceRunState = "idle" | "working" | "waiting" | "paused" | "done" | "failed";
@@ -433,6 +434,12 @@ export interface ComputerAction {
   at: number;
   /** The framebuffer the coordinates were clamped to (overlay positioning). */
   framebuffer: FramebufferSize;
+  /**
+   * The action effect from the tool result (core-23): what the screen did
+   * after the action settled. Set when the run stream paired this action's
+   * tool.call with a tool.result whose output carried an effect line.
+   */
+  effect?: ActionEffect;
 }
 
 /** Key-combo charset: printable keysym names plus modifiers, no shell chars. */
@@ -768,20 +775,54 @@ export function computerActionLabel(action: ComputerAction): string {
  * overlay. Tool calls are authoritative; `computer.action` telemetry events
  * are the fallback when a stream carries only those. Returns undefined when
  * the stream has no computer-use action.
+ *
+ * Tool results pair with their calls by id: a result whose output carries a
+ * computer-mcp effect line (core-23) attaches it to the same action, so the
+ * overlay chip can show what the screen did after the action settled.
  */
 export function deriveComputerAction(items: readonly RunStreamItem[]): ComputerAction | undefined {
   let latest: ComputerAction | undefined;
+  const callsById = new Map<string, ComputerAction>();
   for (const item of items) {
     if (item.kind === "tool.call") {
       const payload = payloadOf(item);
       const name = str(payload.name);
       if (!name) continue;
       const action = parseComputerAction(name, payload.input, item.ts);
-      if (action) latest = action;
+      if (action) {
+        latest = action;
+        const id = str(payload.id);
+        if (id) callsById.set(id, action);
+      }
+    } else if (item.kind === "tool.result") {
+      const payload = payloadOf(item);
+      const id = str(payload.id);
+      const call = id ? callsById.get(id) : undefined;
+      if (id && call) callsById.delete(id);
+      if (!call) continue;
+      const output = str(payload.output);
+      const effect = output ? parseEffectLine(output) : null;
+      if (effect) call.effect = effect;
     } else if (item.kind === "computer.action") {
       const action = computerActionFromEvent(payloadOf(item), item.ts);
       if (action) latest = action;
     }
   }
   return latest;
+}
+
+/**
+ * Epoch ms of the newest non-escalated `watchdog.loop` nudge (core-21), or
+ * undefined when the stream carries none. Escalation halts the run — it is
+ * not a "nudged" moment, so it is skipped.
+ */
+export function lastLoopNudgeAt(items: readonly RunStreamItem[]): number | undefined {
+  let at: number | undefined;
+  for (const item of items) {
+    if (item.kind !== "watchdog.loop") continue;
+    const payload = payloadOf(item);
+    if (payload.action === "escalate") continue;
+    at = item.ts;
+  }
+  return at;
 }

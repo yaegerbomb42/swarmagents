@@ -20,6 +20,9 @@ import path from "node:path";
 import { resolveDataDir, userDirName, type DataDirOptions } from "../providers/store";
 import { atomicWriteFile } from "../atomic-write";
 import { isComputeTarget } from "../computers/compute";
+import { RUN_ID_RE } from "../telemetry/paths";
+import { readReplayBytes, readRunReport } from "../runtime/run-report";
+import type { RunReport } from "../runtime/run-report-types";
 
 export const PROJECTS_SCHEMA = "swarm-projects";
 export const PROJECTS_VERSION = 1;
@@ -75,6 +78,31 @@ export interface ProjectShare {
   token: string;
   createdAt: number;
   revokedAt?: number;
+  /**
+   * Owner-curated replay showcase (core-32): one finished run whose desktop
+   * replay and redacted summary the public page may render. Set explicitly
+   * by the owner (POST /api/projects/{id}/share with a runId) — never
+   * automatic, so a share link stays a work snapshot by default.
+   */
+  showcase?: ShareShowcase;
+}
+
+/**
+ * The public, redacted showcase for a share link. Counts and status only —
+ * no paths, no cost, no token accounting, no artifact names. The prompt is
+ * the run's original task text, credential-redacted and bounded, because it
+ * is what a Fork Prompt CTA copies into the visitor's own workspace.
+ */
+export interface ShareShowcase {
+  runId: string;
+  prompt: string;
+  status: string;
+  steps: number;
+  shots: number;
+  artifacts: number;
+  durationMs?: number;
+  model?: string;
+  sharedAt: number;
 }
 
 export interface Project {
@@ -111,6 +139,8 @@ export interface SharedProjectView {
   threadCount: number;
   updatedAt: number;
   sharedAt: number;
+  /** Owner-curated replay showcase, when one was attached. */
+  showcase: ShareShowcase | null;
 }
 
 /**
@@ -267,15 +297,41 @@ function cleanTest(value: unknown): ProjectTestResult | null {
   };
 }
 
+/** The stored showcase is redacted at creation; the read-back only re-bounds it. */
+function cleanShowcase(value: unknown): ShareShowcase | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const runId = typeof record.runId === "string" ? record.runId : "";
+  if (!RUN_ID_RE.test(runId)) return null;
+  const prompt = typeof record.prompt === "string" ? record.prompt.slice(0, 2000) : "";
+  if (!prompt) return null;
+  const steps = num(record.steps) ?? 0;
+  const shots = num(record.shots) ?? 0;
+  const artifacts = num(record.artifacts) ?? 0;
+  return {
+    runId,
+    prompt,
+    status: typeof record.status === "string" ? record.status.slice(0, 32) : "finished",
+    steps: Math.max(0, steps),
+    shots: Math.max(0, shots),
+    artifacts: Math.max(0, artifacts),
+    ...(num(record.durationMs) !== undefined ? { durationMs: num(record.durationMs) } : {}),
+    ...(typeof record.model === "string" && record.model ? { model: record.model.slice(0, 120) } : {}),
+    sharedAt: num(record.sharedAt) ?? 0,
+  };
+}
+
 function cleanShare(value: unknown): ProjectShare | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const token = typeof record.token === "string" ? record.token : "";
   if (!SHARE_TOKEN_RE.test(token)) return null;
+  const showcase = cleanShowcase(record.showcase);
   return {
     token,
     createdAt: num(record.createdAt) ?? 0,
     ...(num(record.revokedAt) !== undefined ? { revokedAt: num(record.revokedAt) } : {}),
+    ...(showcase ? { showcase } : {}),
   };
 }
 
@@ -521,13 +577,17 @@ export function createShareLink(userId: string, projectId: string, options: Data
   // One-time legacy migration (see ensureShareIndex) before the first write,
   // so a share created after the upgrade never hides an older share.
   ensureShareIndex(options);
-  const previous = getProject(userId, projectId, options)?.share?.token;
+  const currentProject = getProject(userId, projectId, options);
+  const previous = currentProject?.share?.token;
+  // The curated replay showcase belongs to the project's share, not to one
+  // token: a rotation keeps it, so the new link shows the same showcase.
+  const carriedShowcase = currentProject?.share?.showcase;
   const token = randomBytes(SHARE_TOKEN_BYTES).toString("hex");
   const project = mutateProject(
     userId,
     projectId,
     (current) => {
-      current.share = { token, createdAt: Date.now() };
+      current.share = { token, createdAt: Date.now(), ...(carriedShowcase ? { showcase: carriedShowcase } : {}) };
     },
     options,
   );
@@ -546,6 +606,56 @@ export function createShareLink(userId: string, projectId: string, options: Data
     options,
   );
   return share;
+}
+
+/**
+ * Attach (or replace) the share link's public replay showcase: one finished
+ * run of this owner. The run must belong to the caller and must actually
+ * have a stored desktop replay — the showcase promises a playable replay, so
+ * a run without one is rejected rather than rendered as an empty box.
+ * Everything exposed is derived from the run's own report (never from client
+ * input) and credential-redacted.
+ */
+export function setShareShowcase(
+  userId: string,
+  projectId: string,
+  runId: unknown,
+  options: DataDirOptions = {},
+): ShareShowcase {
+  requireUserId(userId);
+  if (typeof runId !== "string" || !RUN_ID_RE.test(runId)) {
+    throw new ProjectError("A valid runId is required.", 400);
+  }
+  const project = getProject(userId, projectId, options);
+  if (!project) throw new ProjectError("Project not found.", 404);
+  if (!project.share || project.share.revokedAt) {
+    throw new ProjectError("Create a share link before adding a replay showcase.", 409);
+  }
+  // Only the owner's own finished runs can be showcased. The run log is the
+  // fallback for older reports that predate the userId field.
+  const report: RunReport | null = readRunReport(runId);
+  const owner = report?.userId || undefined;
+  if (!report || (owner && owner !== userId)) {
+    throw new ProjectError("Run not found for this account.", 404);
+  }
+  if (!readReplayBytes(runId)) {
+    throw new ProjectError("This run has no desktop replay to showcase.", 409);
+  }
+  const showcase: ShareShowcase = {
+    runId,
+    prompt: redactForShare(report.prompt).slice(0, 2000),
+    status: report.status,
+    steps: report.meta.steps,
+    shots: report.meta.shots,
+    artifacts: report.meta.artifacts,
+    ...(report.meta.durationMs !== undefined ? { durationMs: report.meta.durationMs } : {}),
+    ...(report.meta.model ? { model: report.meta.model } : {}),
+    sharedAt: Date.now(),
+  };
+  mutateProject(userId, projectId, (current) => {
+    if (current.share) current.share.showcase = showcase;
+  }, options);
+  return showcase;
 }
 
 /** Revoke the share link; the token stops resolving immediately. */
@@ -608,6 +718,7 @@ export function toSharedView(project: Project, sharedAt: number): SharedProjectV
     threadCount: project.threads.length,
     updatedAt: project.updatedAt,
     sharedAt,
+    showcase: project.share?.showcase ?? null,
   };
 }
 

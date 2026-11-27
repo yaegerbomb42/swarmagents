@@ -129,7 +129,8 @@ or a throwaway box.
 
 ### Standard vs hard tasks
 
-`--tasks` takes ids or the set names `standard` and `hard`.
+`--tasks` takes ids or the set names `standard`, `hard` and `desktop`
+(desktop tasks are never in the default run).
 
 - **standard** (6 tasks, `provider-tasks.ts`): smoke level. A free 30B
   model clears all six at ~8 turns / ~10 s each, so they prove the stack
@@ -156,6 +157,103 @@ tokens (4.9x) and wall clock (9.4x).
 The hard miss was genuine: `-2^2` evaluated to 4 and `1 2` was accepted,
 both spelled out in the prompt. Every task's verifier must fail the
 untouched setup and pass the reference solution (`provider-tasks.test.ts`).
+
+### Desktop tasks (`--tasks desktop`)
+
+The coding sets never touch the A1 desktop. `--tasks desktop` runs three
+GUI tasks (`provider-tasks-desktop.ts`) that do:
+
+- the live executor boots a throwaway Xvfb display (plus xfwm4 when
+  installed) with the task's windows (`desktop-session.ts`), and
+- wires **only** computer-mcp: `--allowedTools mcp__computer-mcp`,
+  `--mcp-config` pointing at `vm-image-desktop/computer-mcp/server.mjs` on
+  that display, with Bash/Write/Edit/Read/etc. denied in settings. A pass
+  means the agent drove the desktop.
+
+| Task | What it needs |
+| --- | --- |
+| `desktop-terminal-write-file` | open a terminal with `open_app`, type commands, press Enter |
+| `desktop-pick-the-right-window` | two xterms (alpha, beta) in unnamed dirs; act only in beta |
+| `desktop-read-code-from-screen` | read a per-run code (`DESK-xxxxxx`) off the screen, write it via a second terminal |
+
+Each trial row also gets `desktop: {computerActions, noChangeEffects,
+loopNudges}`. These tasks need Xvfb, xdotool, scrot, ImageMagick and xterm;
+the CLI exits 2 with the missing list otherwise. Pass `--text-desktop` for
+text-only models (screenshot returns `describe_screen` text: windows,
+AT-SPI widgets, OCR text targets).
+
+```bash
+npm run eval:live -- --claude-bin /path/to/wrapper --model M --tasks desktop --text-desktop
+```
+
+Live baseline (2026-11-26, text-desktop, 1 trial):
+
+| Model | pass@1 | Mean turns | Mean computer actions | Mean input tok | Mean seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mercury | 3/3 | 13.7 | 11.7 | 129,932 | 21.1 |
+| nvidia/nemotron-3.5-lightning-30b-a3b | 0/3 | 18.0 | 17.3 | 182,124 | 33.9 |
+
+Both models scored 6/6 on the standard coding set, but the desktop set
+separates them completely.
+
+What the first run found: the post-hoc risk gate **halted the whole run**
+on any malformed computer-mcp call (`key {"key":"Enter"}`, `focus_window
+{"window_name":…}`) even though computer-mcp itself rejects those with the
+same validator and nothing executes. All three nemotron trials died on
+their first typo. Those denies are now marked `malformed` and the run
+continues, so the model sees the tool's error and retries, the same as on
+the approval-hook path production uses. The remaining failures are the
+model's own: it typed `touch marker.txt` and never pressed Enter, and it
+kept clicking the code instead of opening a second terminal.
+
+**After core-37** (forgiving computer-mcp args): computer-mcp now maps the
+argument slips seen above (`key {"key":"Enter"}`, `focus_window {"window":…}`,
+`open_app {"app":…}`, `type {submit:true}`, `click {coordinate:[x,y]}`) to the
+canonical calls, every alias is declared in the MCP schema (zod strips unknown
+keys before the handler runs), a `type` that did not press Enter says so, and a
+second unsubmitted `type` into the same terminal is refused once ("… never
+ran") instead of stacking `lspwdecho …` on the prompt. Nothing runs
+implicitly. Same suite, same graders:
+
+| Model | pass@1 | Mean turns | Mean input tok | Mean seconds |
+| --- | ---: | ---: | ---: | ---: |
+| nvidia/nemotron-3.5-lightning-30b-a3b (before) | 0/3 | 18.0 | 182,124 | 33.9 |
+| nvidia/nemotron-3.5-lightning-30b-a3b (after) | 3/3 | 12.7 | 116,941 | 16.9 |
+| mercury (before) | 3/3 | 13.7 | 129,932 | 21.1 |
+| mercury (after) | 3/3 | 9.7 | 101,372 | 13.4 |
+
+### Harder desktop tasks (`--tasks desktop-hard`)
+
+After core-37 both models solve the three tasks above, so `desktop-hard`
+(`provider-tasks-desktop-hard.ts`) adds real GUI work. `--tasks desktop`
+still selects only the original three, so the baselines above stay
+comparable.
+
+| Task | What it needs |
+| --- | --- |
+| `desktop-browser-rendered-value` | a Chromium app window whose total is computed by JavaScript (not in the HTML); read it off the screen |
+| `desktop-find-error-log` | four logs, one with an ERROR line (chosen per run); search in a terminal and read the output |
+| `desktop-spreadsheet-total` | `sales.csv` opening in LibreOffice Calc behind its Text Import dialog; add a SUM row, save as CSV through Keep Current Format |
+
+Tasks declare extra host binaries in `desktop.requires` (`soffice`,
+`chromium`/`google-chrome`); the CLI checks only the selected tasks.
+
+```bash
+npm run eval:live -- --claude-bin /path/to/wrapper --model M --tasks desktop-hard --text-desktop
+```
+
+Live baseline (2026-11-26, text-desktop, 1 trial, 30 max turns):
+
+| Model | pass@1 | browser | error log | spreadsheet | Mean turns | Mean input tok |
+| --- | ---: | --- | --- | --- | ---: | ---: |
+| mercury | 2/3 | pass (9 turns) | FAIL (max turns) | pass | 23.7 | 371,474 |
+| nvidia/nemotron-3.5-lightning-30b-a3b | 1/3 | pass (31) | FAIL (max turns) | FAIL (1/2) | 31.0 | 429,626 |
+
+The error-log misses come from the same cause for both models: they ran the
+right `grep`, but describe_screen's OCR reads a dark terminal as fragments
+(`"charlie. log"`, `"lbox@grok-bot -vm…:~/logss ff"`), so a text-only model
+cannot see the command's output. core-38 (`read_window_text`) targets
+exactly this.
 
 ## Relation to the capability-atlas eval
 

@@ -40,6 +40,25 @@ export interface WorkspaceFile {
   content?: string;
 }
 
+/** One recently-modified workspace file, as the recent-scan reports it. */
+export interface WorkspaceRecentFile {
+  name: string;
+  path: string;
+  size: number;
+  modifiedAt: number;
+  /** Inline-safe Content-Type for an <img> render. */
+  contentType: string;
+}
+
+export interface WorkspaceRecentFiles {
+  path: string;
+  kind: "recent";
+  /** Epoch ms the scan looked back from (now - windowMs). */
+  since: number;
+  windowMs: number;
+  files: WorkspaceRecentFile[];
+}
+
 /** Categories the UI can render for a failed file request. */
 export type FileBrowserErrorKind =
   | "invalid_path"
@@ -270,6 +289,72 @@ export async function fetchWorkspaceFile(
   options: FilesRequestOptions = {},
 ): Promise<WorkspaceFile> {
   return (await requestJson(path, true, parseFile, options)) as WorkspaceFile;
+}
+
+function parseRecent(body: unknown): WorkspaceRecentFiles {
+  const obj = asObject(body);
+  if (!obj || obj.kind !== "recent" || !Array.isArray(obj.files)) {
+    throw new FileBrowserError("malformed", "The VM file API returned an unexpected recent-files payload.");
+  }
+  const files: WorkspaceRecentFile[] = [];
+  for (const raw of obj.files) {
+    const file = asObject(raw);
+    const name = asString(file?.name);
+    const path = asString(file?.path);
+    const modifiedAt = asNumber(file?.modifiedAt);
+    if (!file || !name || !path || modifiedAt === undefined) {
+      throw new FileBrowserError("malformed", "The VM file API returned an invalid recent file.");
+    }
+    files.push({
+      name,
+      path,
+      size: asNumber(file.size) ?? 0,
+      modifiedAt,
+      contentType: asString(file.contentType) ?? "application/octet-stream",
+    });
+  }
+  return {
+    path: asString(obj.path) ?? WORKSPACE_ROOT,
+    kind: "recent",
+    since: asNumber(obj.since) ?? 0,
+    windowMs: asNumber(obj.windowMs) ?? 0,
+    files,
+  };
+}
+
+/**
+ * Fetch the workspace's recently-touched files (GET with recent=1; default
+ * look-back 15 minutes, hard-capped at one hour, result capped at 25 files).
+ */
+export async function fetchRecentWorkspaceFiles(
+  options: FilesRequestOptions & { path?: string; windowMs?: number; limit?: number } = {},
+): Promise<WorkspaceRecentFiles> {
+  const params = new URLSearchParams({ path: normalizeWorkspacePath(options.path) });
+  params.set("recent", "1");
+  if (options.windowMs !== undefined) params.set("windowMs", String(Math.floor(options.windowMs)));
+  if (options.limit !== undefined) params.set("limit", String(Math.floor(options.limit)));
+  const fetchImpl = options.fetchImpl ?? fetch;
+  let res: Response;
+  try {
+    res = await fetchImpl(`/api/runtime/vm/files?${params.toString()}`, { signal: options.signal });
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    throw new FileBrowserError("network", "Could not reach the VM file API.");
+  }
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  if (!res.ok) {
+    const obj = asObject(body);
+    const code = asString(obj?.code);
+    const message = asString(obj?.error) ?? `The VM file API returned ${res.status}.`;
+    const kind = STATUS_ERROR_KIND[res.status] ?? "server";
+    throw new FileBrowserError(kind, message, { status: res.status, code });
+  }
+  return parseRecent(body);
 }
 
 /**

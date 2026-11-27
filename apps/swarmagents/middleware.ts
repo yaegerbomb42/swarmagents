@@ -66,6 +66,11 @@ const PUBLIC = new Set([
  */
 const PUBLIC_PREFIXES = [
   "/share/",
+  // Token-gated share APIs (core-32): the token in the path is the
+  // credential. Every handler under this prefix re-validates the token
+  // server-side (share page state, guest suggestions, showcase replay), so
+  // a signed-out guest holding the link gets exactly what the link grants.
+  "/api/share/",
   // Token-gated VM preview links (F10): the token in the path is the
   // credential, like the project share pages above.
   "/preview/share/",
@@ -156,7 +161,7 @@ export function middleware(req: NextRequest) {
   // anyone holding the link, so they are throttled per IP in every mode: a
   // scanner minting random tokens must not be able to turn one request into a
   // sweep of every account on the box (bug 19).
-  if (pathname.startsWith("/share/") || pathname.startsWith("/preview/share/")) {
+  if (pathname.startsWith("/share/") || pathname.startsWith("/preview/share/") || pathname.startsWith("/api/share/")) {
     const result = rateLimitCheck(pathname, shareRateLimitKey(req));
     if (result) {
       rate = result;

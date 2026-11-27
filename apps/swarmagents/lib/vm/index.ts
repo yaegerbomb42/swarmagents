@@ -96,6 +96,12 @@ export {
 } from "./limits";
 export { FakeVmDriver } from "./fake-driver";
 export {
+  SWARM_VM_WARM_POOL_SIZE_ENV,
+  WarmPool,
+  resolveWarmPoolSize,
+  type WarmPoolDriver,
+} from "./warm-pool";
+export {
   ByocVmDriver,
   BYOC_CONTAINER_PREFIX,
   DEFAULT_BYOC_RESUME_TIMEOUT_MS,

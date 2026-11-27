@@ -18,6 +18,7 @@ import {
   getProject,
   isProjectId,
   revokeShareLink,
+  setShareShowcase,
 } from "../../../../../lib/projects/store";
 
 export const runtime = "nodejs";
@@ -35,8 +36,22 @@ export async function POST(req: NextRequest, context: { params: Promise<{ id: st
   if (!getProject(user, id)) return notFound();
   try {
     const share = createShareLink(user, id);
+    // Optional replay showcase (core-32): body { runId } curates one finished
+    // run's replay onto the public page. Everything exposed is derived from
+    // the run's own report server-side and credential-redacted.
+    let showcase: unknown = null;
+    try {
+      const body = (await req.json()) as { runId?: unknown };
+      if (body?.runId !== undefined) showcase = setShareShowcase(user, id, body.runId);
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        // No/invalid body: a plain share rotate is still valid.
+      } else {
+        throw err;
+      }
+    }
     recordAudit({ user, action: "project.share.create", target: id, result: "success" });
-    return noStoreJson({ share: { token: share.token, createdAt: share.createdAt } });
+    return noStoreJson({ share: { token: share.token, createdAt: share.createdAt }, ...(showcase ? { showcase } : {}) });
   } catch (err) {
     recordAudit({ user, action: "project.share.create", target: id, result: "failure" });
     return noStoreRouteError(err, "Could not create the share link.");

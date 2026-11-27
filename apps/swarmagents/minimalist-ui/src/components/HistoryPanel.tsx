@@ -9,8 +9,9 @@
  */
 
 import React, { useMemo, useState } from "react";
-import { Search, SquarePen, X } from "lucide-react";
+import { Clock, Search, SquarePen, X } from "lucide-react";
 import { formatRelativeTime, type ThreadSummary } from "../../../lib/client/thread";
+import type { UnreadScheduledRun } from "../../../lib/client/schedules";
 import { cn } from "../utils/cn";
 import { Button, Loading, Notice, Sheet, StatusBadge } from "./ui";
 import { EmptyState } from "./brand/EmptyState";
@@ -28,6 +29,10 @@ export interface HistoryPanelProps {
   onNewChat: () => void;
   newChatDisabled: boolean;
   onRetry: () => void;
+  /** Unread completed scheduled runs to surface with a quick jump action. */
+  unreadCronRuns?: readonly UnreadScheduledRun[];
+  onJumpToCronRun?: (runId: string) => void;
+  onMarkCronRunsRead?: () => void;
 }
 
 export function filterThreads(threads: readonly ThreadSummary[], query: string): ThreadSummary[] {
@@ -50,6 +55,9 @@ export function HistoryPanel({
   onNewChat,
   newChatDisabled,
   onRetry,
+  unreadCronRuns = [],
+  onJumpToCronRun,
+  onMarkCronRunsRead,
 }: HistoryPanelProps) {
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -74,6 +82,45 @@ export function HistoryPanel({
           <SquarePen className="h-4 w-4" aria-hidden />
           New chat
         </Button>
+
+        {unreadCronRuns.length > 0 && (
+          <div className="rounded-xl border border-emerald-400/25 bg-emerald-500/5 p-2.5" data-testid="unread-cron-runs">
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-300">
+                <Clock className="h-3 w-3" aria-hidden />
+                Scheduled runs ({unreadCronRuns.length})
+              </span>
+              {onMarkCronRunsRead && (
+                <button
+                  type="button"
+                  onClick={onMarkCronRunsRead}
+                  data-testid="mark-cron-runs-read"
+                  className="cursor-pointer text-[11px] text-sa-fg3 hover:text-sa-fg"
+                >
+                  Mark read
+                </button>
+              )}
+            </div>
+            <ul className="space-y-1">
+              {unreadCronRuns.map((item) => (
+                <li key={item.runId}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onJumpToCronRun?.(item.runId);
+                      onClose();
+                    }}
+                    data-testid={`unread-cron-run-${item.runId}`}
+                    className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-sa-fg hover:bg-sa-hover"
+                  >
+                    <span className="min-w-0 truncate">{item.scheduleName}</span>
+                    <span className="shrink-0 text-[11px] text-sa-fg3">{formatRelativeTime(item.ranAt)}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {state === "ready" && threads.length > 0 && (
           <div className="relative">

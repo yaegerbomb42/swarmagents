@@ -36,6 +36,7 @@ import { fetchListeningPorts } from "../../../../lib/client/previewPorts";
 import {
   deriveComputerAction,
   derivePresence,
+  lastLoopNudgeAt,
   presenceFromActivity,
   type ComputerAction,
   type Presence,
@@ -128,6 +129,12 @@ export interface VmScreenProps {
    * derivation when present (same pattern as `presence`).
    */
   computerAction?: ComputerAction;
+  /**
+   * The newest watchdog.loop nudge (epoch ms), derived by the page from the
+   * run stream it already consumes. Wins over this component's own
+   * derivation when present (same pattern as `presence`).
+   */
+  loopNudgeAt?: number;
 }
 
 /** The facts the status bar needs about the live desktop connection. */
@@ -160,6 +167,7 @@ export function VmScreen({
   activity,
   presence: pagePresence,
   computerAction: pageComputerAction,
+  loopNudgeAt: pageLoopNudgeAt,
 }: VmScreenProps) {
   const stream = useRunStream(runId);
   const liveRun = Boolean(runId);
@@ -187,6 +195,14 @@ export function VmScreen({
     [stream.items],
   );
   const effectiveComputerAction = pageComputerAction ?? streamComputerAction;
+
+  // The newest loop nudge, for the overlay chip flash: page derivation wins
+  // when the page owns the stream, else this component's own stream.
+  const streamLoopNudgeAt = useMemo(
+    () => lastLoopNudgeAt(stream.items),
+    [stream.items],
+  );
+  const effectiveLoopNudgeAt = pageLoopNudgeAt ?? streamLoopNudgeAt;
 
   // VM display state: the run stream's vm.* updates (immediate while a run is
   // live) plus the polled VM state, which is the only signal that sees idle
@@ -451,6 +467,7 @@ export function VmScreen({
               onStopRun={onStopRun}
               presence={effectivePresence}
               computerAction={effectiveComputerAction}
+              loopNudgeAt={effectiveLoopNudgeAt}
               embedded
               control={control}
               onControlChange={onControlChange}

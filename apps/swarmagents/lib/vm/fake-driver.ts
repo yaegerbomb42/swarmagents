@@ -66,6 +66,13 @@ interface FakeVm {
   mtimes: Map<string, number>;
   running: boolean;
   snapshots: Map<string, FakeSnapshot>;
+  /**
+   * Simulated desktop VNC password. Only warm-pool VMs carry one: prewarm
+   * seeds it and adoptWarm regenerates it, so tests can prove the real
+   * driver's fresh-VNC-password isolation contract. Cold-ensured VMs stay
+   * undefined (the fake has no desktop).
+   */
+  vncPassword?: string;
 }
 
 export interface FakeVmDriverOptions {
@@ -218,6 +225,46 @@ export class FakeVmDriver implements VmDriver {
     const vm = this.getOrCreateVm(userId);
     vm.running = true;
     return vm.handle;
+  }
+
+  /**
+   * Warm-pool capability: boot an unassigned VM under a driver-internal
+   * identity. It behaves like any VM but is never shown to a real user
+   * until adoptWarm reassigns it with full isolation.
+   */
+  async prewarm(): Promise<VmHandle> {
+    const warmId = `__warm__:${randomBytes(8).toString("hex")}`;
+    const vm = this.getOrCreateVm(warmId);
+    vm.running = true;
+    vm.vncPassword = randomBytes(9).toString("base64");
+    return vm.handle;
+  }
+
+  /**
+   * Warm-pool capability: hand a prewarmed VM to a real user. Fresh
+   * /workspace volume (every file, link, and snapshot is wiped) and a fresh
+   * VNC password before the first exec, so no warm-phase state can leak
+   * across users.
+   */
+  async adoptWarm(warm: VmHandle, userId: string): Promise<VmHandle> {
+    const vm = this.vms.get(warm.userId);
+    if (!vm || !vm.running) throw new Error(`warm VM missing or stopped: ${warm.containerName}`);
+    if (this.vms.has(userId)) throw new Error(`user already has a VM: ${userId}`);
+    this.vms.delete(warm.userId);
+    vm.files.clear();
+    vm.links.clear();
+    vm.mtimes.clear();
+    vm.snapshots.clear();
+    vm.running = true;
+    vm.handle = { userId, containerName: `fake-${userId}`, createdAt: Date.now() };
+    vm.vncPassword = randomBytes(9).toString("base64");
+    this.vms.set(userId, vm);
+    return vm.handle;
+  }
+
+  /** Test/introspection view of the simulated VNC password (never logged). */
+  vncPasswordFor(handle: VmHandle): string | undefined {
+    return this.vms.get(handle.userId)?.vncPassword;
   }
 
   /**

@@ -31,6 +31,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Check,
+  Clock,
   Copy,
   Download,
   FileCode2,
@@ -40,11 +41,13 @@ import {
   FolderOpen,
   Loader2,
   RefreshCw,
+  Table2,
   X,
 } from "lucide-react";
 import {
   WORKSPACE_ROOT,
   describeFilesError,
+  fetchRecentWorkspaceFiles,
   fetchWorkspaceFile,
   fetchWorkspaceListing,
   formatBytes,
@@ -53,6 +56,7 @@ import {
   type WorkspaceEntry,
   type WorkspaceFile,
   type WorkspaceListing,
+  type WorkspaceRecentFile,
   workspaceFileDownloadUrl,
 } from "../../../lib/client/files";
 import type { Presence } from "../../../lib/client/presence";
@@ -84,7 +88,9 @@ interface FilesViewProps {
   readonly presence?: Presence;
 }
 
-type FileKind = "code" | "image" | "text" | "binary";
+type FileKind = "code" | "image" | "text" | "binary" | "csv";
+/** How the reading pane renders an open file. */
+export type PreviewVariant = FileKind;
 
 const CODE_EXTENSIONS = new Set([
   "c", "cc", "cpp", "cs", "css", "go", "h", "hpp", "html", "java", "js", "jsx",
@@ -115,9 +121,16 @@ function fileKind(entry: WorkspaceEntry): FileKind {
   if (entry.type === "other") return "binary";
   const extension = extensionOf(entry.name);
   if (IMAGE_EXTENSIONS.has(extension)) return "image";
+  if (extension === "csv" || extension === "tsv") return "csv";
   if (CODE_EXTENSIONS.has(extension)) return "code";
   if (TEXT_EXTENSIONS.has(extension)) return "text";
   return "binary";
+}
+
+/** How the reading pane will render the file at `path`. */
+export function previewVariantForPath(path: string): PreviewVariant {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return fileKind({ name, path, type: "file", size: 0 });
 }
 
 /** Small, consistent file-type mark: shape by kind, tint by kind. */
@@ -132,6 +145,8 @@ function entryIcon(entry: WorkspaceEntry, open = false) {
   switch (fileKind(entry)) {
     case "code":
       return <FileCode2 className="h-3.5 w-3.5 shrink-0 text-sky-300/80" />;
+    case "csv":
+      return <Table2 className="h-3.5 w-3.5 shrink-0 text-lime-300/80" />;
     case "image":
       return <FileImage className="h-3.5 w-3.5 shrink-0 text-emerald-300/80" />;
     case "text":
@@ -468,6 +483,220 @@ function CodeBody({ content }: { readonly content: string }) {
   );
 }
 
+/**
+ * Parse CSV/TSV text into rows. Handles RFC-4180 quoting: a quoted field may
+ * contain commas and doubled `""` escapes. Pure, so the parser is unit-tested
+ * without a DOM. Rows beyond `maxRows` are counted, not rendered.
+ */
+export function csvRows(
+  content: string,
+  maxRows = 100,
+  delimiter = ",",
+): { rows: string[][]; hidden: number } {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  let sawAny = false;
+  for (let i = 0; i < content.length; i += 1) {
+    const ch = content[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (content[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+    if (ch === '"' && field === "") {
+      inQuotes = true;
+      sawAny = true;
+      continue;
+    }
+    if (ch === delimiter) {
+      row.push(field);
+      field = "";
+      sawAny = true;
+      continue;
+    }
+    if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && content[i + 1] === "\n") i += 1;
+      row.push(field);
+      field = "";
+      if (row.length > 1 || row[0] !== "" || sawAny) rows.push(row);
+      row = [];
+      sawAny = false;
+      continue;
+    }
+    field += ch;
+    sawAny = true;
+  }
+  if (inQuotes || field !== "" || sawAny) {
+    row.push(field);
+    rows.push(row);
+  }
+  return { rows: rows.slice(0, Math.max(1, maxRows)), hidden: Math.max(0, rows.length - maxRows) };
+}
+
+/** An inline CSV/TSV preview: sticky header row, capped rows, honest footer. */
+export function CsvTable({ content, delimiter = ",", maxRows = 100 }: {
+  readonly content: string;
+  readonly delimiter?: string;
+  readonly maxRows?: number;
+}) {
+  const { rows, hidden } = useMemo(() => csvRows(content, maxRows, delimiter), [content, maxRows, delimiter]);
+  if (rows.length === 0) {
+    return <div className="p-4 font-mono text-[11px] text-white/30">The file is empty.</div>;
+  }
+  const [header, ...body] = rows;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 overflow-auto scrollbar-thin" data-testid="files-csv-table">
+        <table className="w-full border-separate border-spacing-0 font-mono text-[11px] leading-[1.55]">
+          <thead>
+            <tr>
+              {header.map((cell, index) => (
+                <th
+                  key={index}
+                  className="sticky top-0 border-b border-white/10 bg-[#0d0d11] px-3 py-1.5 text-left align-bottom font-medium text-white/60"
+                >
+                  {cell}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {body.map((row, rowIndex) => (
+              <tr key={rowIndex}>
+                {row.map((cell, index) => (
+                  <td key={index} className="whitespace-pre-wrap break-words px-3 py-1 align-top text-white/80">
+                    {cell || " "}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {hidden > 0 && (
+        <div className="shrink-0 border-t border-white/[0.06] bg-black/30 px-3 py-1.5 font-mono text-[10px] text-white/45">
+          {hidden} more rows in the file
+        </div>
+      )
+      }
+    </div>
+  );
+}
+
+/** An inline image preview: the file comes straight from the VM via the download URL. */
+function ImagePreview({ path, size }: { readonly path: string; readonly size: number }) {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4" data-testid="files-image-preview">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={workspaceFileDownloadUrl(path)}
+          alt={name}
+          className="max-h-full max-w-full object-contain"
+        />
+      </div>
+      <div className="shrink-0 border-t border-white/[0.06] bg-black/30 px-3 py-1.5 font-mono text-[10px] text-white/45">
+        {formatBytes(size)} · rendered from the VM
+      </div>
+    </div>
+  );
+}
+
+/** A short human age for a file's mtime; pure so labels are unit-tested. */
+export function relativeAge(modifiedAt: number | undefined, now: number): string {
+  if (!modifiedAt || !Number.isFinite(modifiedAt)) return "";
+  const seconds = Math.max(0, Math.floor((now - modifiedAt) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
+}
+
+/** Recently touched files across the whole workspace, polled while the run streams. */
+function RecentStrip({ live, refreshToken, onOpen }: {
+  readonly live: boolean;
+  readonly refreshToken: number;
+  readonly onOpen: (file: WorkspaceRecentFile) => void;
+}) {
+  const [recent, setRecent] = useState<WorkspaceRecentFile[]>();
+  const [now, setNow] = useState(() => Date.now());
+  const inFlight = useRef<AbortController | undefined>(undefined);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    fetchRecentWorkspaceFiles({ limit: 8, signal: ctrl.signal })
+      .then((data) => {
+        if (ctrl.signal.aborted) return;
+        setRecent(data.files);
+      })
+      .catch(() => {
+        if (!ctrl.signal.aborted) setRecent(undefined);
+      });
+    return () => ctrl.abort();
+  }, [refreshToken]);
+
+  useEffect(() => {
+    if (!live) return;
+    const poll = () => {
+      inFlight.current?.abort();
+      const ctrl = new AbortController();
+      inFlight.current = ctrl;
+      fetchRecentWorkspaceFiles({ limit: 8, signal: ctrl.signal })
+        .then((data) => {
+          if (!ctrl.signal.aborted) setRecent(data.files);
+        })
+        .catch(() => {
+          if (!ctrl.signal.aborted) setRecent(undefined);
+        });
+      setNow(Date.now());
+    };
+    poll();
+    const timer = window.setInterval(poll, 3000);
+    const clock = window.setInterval(() => setNow(Date.now()), 30000);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(clock);
+      inFlight.current?.abort();
+    };
+  }, [live]);
+
+  if (!recent || recent.length === 0) return null;
+  return (
+    <div className="shrink-0 border-b border-white/[0.06] px-3 py-2" data-testid="files-recent">
+      <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wide text-white/35">
+        <Clock className="h-3 w-3 shrink-0" />
+        recently touched
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1">
+        {recent.map((entry) => (
+          <button
+            key={entry.path}
+            type="button"
+            onClick={() => onOpen(entry)}
+            title={entry.path}
+            className="flex items-center gap-1.5 rounded border border-white/[0.08] bg-white/[0.04] px-2 py-1 font-mono text-[10px] text-white/70 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <span className="min-w-0 truncate">{entry.name}</span>
+            <span className="shrink-0 text-emerald-300/70">{relativeAge(entry.modifiedAt, now)}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ── The view ────────────────────────────────────────────────────────────── */
 
 /** Compare snapshots only within the same directory; a first listing is not a change. */
@@ -482,12 +711,14 @@ export function changedWorkspaceEntries(previous: WorkspaceListing | undefined, 
   }).map((entry) => entry.path);
 }
 
-/** The body of the reading pane: loading, error, binary, or the file text. */
+/** The body of the reading pane: loading, error, binary, image, CSV, or the file text. */
 function PreviewBody({
+  variant,
   file,
   fileLoading,
   fileError,
 }: {
+  readonly variant: PreviewVariant;
   readonly file?: WorkspaceFile;
   readonly fileLoading: boolean;
   readonly fileError?: string;
@@ -507,11 +738,30 @@ function PreviewBody({
       </div>
     );
   }
+  if (variant === "image") {
+    return <ImagePreview path={file?.path ?? ""} size={file?.size ?? 0} />;
+  }
   if (file?.binary) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
         <AlertTriangle className="h-5 w-5 text-amber-400/70" />
         <div className="text-xs text-white/60">{describeBinaryPreview(file.size)}</div>
+      </div>
+    );
+  }
+  if (variant === "csv" && file?.content !== undefined) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <CsvTable
+          content={file.content}
+          delimiter={file.path.toLowerCase().endsWith(".tsv") ? "\t" : ","}
+        />
+        {file.truncated && (
+          <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
+            <AlertTriangle className="h-3 w-3 shrink-0" />
+            <span>{describeTruncatedPreview(file.limit, file.size)}</span>
+          </div>
+        )}
       </div>
     );
   }
@@ -532,6 +782,7 @@ function PreviewBody({
 function FilePreview({
   selected,
   selectedName,
+  variant,
   isChangedOpen,
   changedFlashKey,
   file,
@@ -544,6 +795,7 @@ function FilePreview({
 }: {
   readonly selected: string;
   readonly selectedName?: string;
+  readonly variant: PreviewVariant;
   readonly isChangedOpen: boolean;
   readonly changedFlashKey: string;
   readonly file?: WorkspaceFile;
@@ -613,7 +865,7 @@ function FilePreview({
         </span>
       </div>
 
-      <PreviewBody file={file} fileLoading={fileLoading} fileError={fileError} />
+      <PreviewBody variant={variant} file={file} fileLoading={fileLoading} fileError={fileError} />
     </>
   );
 }
@@ -757,7 +1009,8 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
   const parent = parentWorkspacePath(path);
   const crumbs = buildCrumbs(path);
   const selectedName = selected ? selected.slice(selected.lastIndexOf("/") + 1) : undefined;
-  const canCopy = Boolean(file && !file.binary && !fileLoading && !fileError && file.content !== undefined);
+  const variant = selected ? previewVariantForPath(selected) : "binary";
+  const canCopy = Boolean(file && !file.binary && variant !== "image" && !fileLoading && !fileError && file.content !== undefined);
   const isChangedOpen = Boolean(selected && selected === changedPath);
   const changedFlashKey = `${changedPath ?? ""}:${changedAt ?? 0}`;
 
@@ -833,18 +1086,30 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
         {/* Reading pane */}
         <div className="flex min-w-0 flex-1 flex-col">
           {!selected ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-              <FolderOpen className="h-5 w-5 text-white/20" />
-              <div className="text-xs text-white/45">Pick a file to read it here.</div>
-              <div className="max-w-[280px] text-[11px] leading-relaxed text-white/30">
-                The agent&apos;s work shows up here as it happens — the file it writes is opened and highlighted
-                automatically.
+            <div className="flex min-h-0 flex-1 flex-col">
+              <RecentStrip
+                live={live}
+                refreshToken={refreshToken}
+                onOpen={(entry) => {
+                  const dir = parentWorkspacePath(entry.path);
+                  if (dir) setPath(dir);
+                  setSelected(entry.path);
+                }}
+              />
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+                <FolderOpen className="h-5 w-5 text-white/20" />
+                <div className="text-xs text-white/45">Pick a file to read it here.</div>
+                <div className="max-w-[280px] text-[11px] leading-relaxed text-white/30">
+                  The agent&apos;s work shows up here as it happens — the file it writes is opened and highlighted
+                  automatically.
+                </div>
               </div>
             </div>
           ) : (
             <FilePreview
               selected={selected}
               selectedName={selectedName}
+              variant={variant}
               isChangedOpen={isChangedOpen}
               changedFlashKey={changedFlashKey}
               file={file}

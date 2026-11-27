@@ -24,6 +24,7 @@ import { URL } from "node:url";
 import { signSession, SESSION_COOKIE } from "../auth";
 import { readAuditEntries, configureAuditPath } from "../audit";
 import { createDesktopProxy, DESKTOP_WS_PATH, type DesktopProxy } from "./proxy";
+import { issueWsTicket, WS_TICKET_TTL_MS } from "../rooms/ws-ticket";
 import {
   encodeFrame,
   encodeClientFrame,
@@ -441,6 +442,7 @@ async function makeProxy(opts: {
   recordFrames?: boolean;
   recordingDir?: string;
   isActiveRun?: (userId: string, runId: string) => boolean;
+  now?: () => number;
 } = {}): Promise<{
   proxy: DesktopProxy;
   port: number;
@@ -467,6 +469,7 @@ async function makeProxy(opts: {
     endpoints[userId as keyof HarnessEndpoints] ?? null;
 
   const proxy = createDesktopProxy({
+    now: opts.now,
     resolveEndpoint,
     resolveGuest:
       opts.resolveGuest ??
@@ -1232,6 +1235,45 @@ test("desktop proxy: recording off by default — no recording file is created",
     await sleep(50);
     assert.equal(fs.readdirSync(recordingDir).length, 0, "no recording dir/file when recordFrames is off");
     client.close();
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: single-use WS ticket connects view-only once and rejects reuse or expiry", async () => {
+  let fakeNow = 1_700_000_000_000;
+  const { proxy, port, aliceVm } = await makeProxy({ now: () => fakeNow });
+  try {
+    const { ticket } = issueWsTicket("alice", fakeNow);
+
+    // First connection with the fresh ticket succeeds (view-only).
+    const client = await TestWsClient.connect(
+      `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&ticket=${encodeURIComponent(ticket)}`,
+    );
+    await completeRfbClientHandshake(client);
+    const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    client.sendBinary(fbur);
+    await sleep(100);
+    assert.ok(Buffer.concat(aliceVm.received).includes(fbur));
+    client.close();
+
+    // Reusing the same ticket is rejected with 401.
+    await assert.rejects(
+      TestWsClient.connect(
+        `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&ticket=${encodeURIComponent(ticket)}`,
+      ),
+      /401/,
+    );
+
+    // Expired ticket is rejected with 401.
+    const { ticket: expiring } = issueWsTicket("alice", fakeNow);
+    fakeNow += WS_TICKET_TTL_MS + 1;
+    await assert.rejects(
+      TestWsClient.connect(
+        `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&ticket=${encodeURIComponent(expiring)}`,
+      ),
+      /401/,
+    );
   } finally {
     await proxy.close();
   }

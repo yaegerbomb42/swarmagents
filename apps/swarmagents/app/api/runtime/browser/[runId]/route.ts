@@ -16,22 +16,12 @@ import { USER_HEADER } from "../../../../../lib/auth";
 import { RUN_ID_RE } from "../../../../../lib/telemetry/paths";
 import { getRuntimeManager } from "../../../../../lib/runtime/manager";
 import { getBrowserManager } from "../../../../../lib/browser/manager";
-import { isDesktopModeEnabled } from "../../../../../lib/vm/desktop";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_BODY_SIZE = 64 * 1024;
 const MAX_URL_LEN = 8192;
-
-/** In desktop mode the agent drives the on-screen browser; the headless frame
- * path is retired (the UI watches the VNC view instead). */
-function desktopModeResponse(): Response {
-  return NextResponse.json(
-    { error: "Desktop mode: the agent drives the on-screen browser; headless browser control is disabled." },
-    { status: 409 },
-  );
-}
 
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
@@ -53,7 +43,6 @@ async function activeRun(req: NextRequest, runId: string): Promise<{ user: strin
 }
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: string }> }) {
-  if (isDesktopModeEnabled()) return desktopModeResponse();
   const { runId } = await ctx.params;
   const gate = await activeRun(req, runId);
   if (gate instanceof Response) return gate;
@@ -73,7 +62,6 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: stri
 }
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ runId: string }> }) {
-  if (isDesktopModeEnabled()) return desktopModeResponse();
   const { runId } = await ctx.params;
   const gate = await activeRun(req, runId);
   if (gate instanceof Response) return gate;

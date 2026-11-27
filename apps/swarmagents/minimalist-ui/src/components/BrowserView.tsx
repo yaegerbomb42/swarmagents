@@ -13,6 +13,12 @@
  * the image bytes come from the polled frame route. Every frame-bearing event
  * bumps the polling hook's refreshKey so a new screenshot appears immediately
  * rather than waiting for the next poll tick.
+ *
+ * The backend mode comes from `/api/runtime/browser/[runId]/mode` (fetched
+ * once per run): "vm" mirrors the Chromium the agent drives inside its
+ * desktop VM, "host" is the historic host-side headless Chromium, and
+ * "unavailable" means there is no browser to mirror — the browser lives
+ * inside the user's computer, so the tab says so instead of showing a frame.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -20,6 +26,7 @@ import { ArrowRight, Globe, Lock, RotateCcw, ShieldAlert } from "lucide-react";
 import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
 import { useBrowserFrame } from "../../../lib/client/useBrowserFrame";
 import type { Presence } from "../../../lib/client/presence";
+import { BROWSER_IN_VM_MESSAGE } from "../../../lib/browser/cdp-messages";
 import { cn } from "../utils/cn";
 
 interface BrowserViewProps {
@@ -284,6 +291,28 @@ function EmptyState({ hasRun, error }: { hasRun: boolean; error?: string }) {
 export function BrowserView({ runId, presence }: BrowserViewProps) {
   const stream = useRunStream(runId);
 
+  // Which browser backend serves this run ("host" | "vm" | "unavailable"),
+  // fetched once per run from the mode route. Null while unknown; a failed
+  // fetch leaves it null and the tab behaves as before.
+  const [mode, setMode] = useState<"host" | "vm" | "unavailable" | null>(null);
+  useEffect(() => {
+    setMode(null);
+    if (!runId) return;
+    let cancelled = false;
+    void fetch(`/api/runtime/browser/${encodeURIComponent(runId)}/mode`, { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        if (cancelled) return;
+        const next = (body as { mode?: string } | null)?.mode;
+        if (next === "host" || next === "vm" || next === "unavailable") setMode(next);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+  const browserUnavailable = mode === "unavailable";
+
   // Frame-bearing events force an immediate refetch (refreshKey bump). The
   // count is monotonic even when the SSE list prunes old items (MAX_LINES),
   // so a new frame event always differs from the previous refreshKey.
@@ -473,8 +502,10 @@ export function BrowserView({ runId, presence }: BrowserViewProps) {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder={runId ? "https://…" : "start a run to open a page"}
-            disabled={!runId || navBusy}
+            placeholder={
+              browserUnavailable ? BROWSER_IN_VM_MESSAGE : runId ? "https://…" : "start a run to open a page"
+            }
+            disabled={!runId || navBusy || browserUnavailable}
             spellCheck={false}
             autoCapitalize="off"
             autoComplete="off"
@@ -485,7 +516,7 @@ export function BrowserView({ runId, presence }: BrowserViewProps) {
 
         <button
           onClick={() => void navigate(draft)}
-          disabled={!runId || navBusy || !draft.trim()}
+          disabled={!runId || navBusy || !draft.trim() || browserUnavailable}
           title="Navigate"
           className="text-white/50 hover:text-cyan-300 disabled:opacity-30 transition"
         >
@@ -537,7 +568,16 @@ export function BrowserView({ runId, presence }: BrowserViewProps) {
 
       {/* Browser viewport */}
       <div className="flex-1 min-h-0 grid place-items-center bg-[#07070a] p-6 overflow-hidden">
-        {frame.frameUrl ? (
+        {browserUnavailable ? (
+          <div className="flex flex-col items-center justify-center gap-4 text-center max-w-md">
+            <div className="text-sm font-medium text-white/90" data-testid="browser-in-vm">
+              {BROWSER_IN_VM_MESSAGE}
+            </div>
+            <p className="text-xs text-white/40 leading-relaxed">
+              The agent browses on the desktop itself, so there is no separate browser page to mirror here.
+            </p>
+          </div>
+        ) : frame.frameUrl ? (
           <BrowserFrameImage frameUrl={frame.frameUrl} previousFrameUrl={frame.previousFrameUrl} />
         ) : (
           <EmptyState hasRun={Boolean(runId)} error={frame.status === "error" ? frame.error : undefined} />

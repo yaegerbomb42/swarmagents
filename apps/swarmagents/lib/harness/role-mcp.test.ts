@@ -242,6 +242,9 @@ test("desktopMcpServerEntry produces concrete stdio entries for the desktop serv
     "--user-data-dir", "/workspace/.swarm/browser-profile",
     "--no-sandbox",
     "--init-page", "/workspace/.swarm/playwright-policy.cjs",
+    // The CDP debug port rides in a config file: the playwright-mcp CLI
+    // rejects unknown flags, so it cannot go on the command line (l10).
+    "--config", "/workspace/.swarm/playwright-mcp.config.json",
   ]);
   assert.deepEqual((playwright as { env: Record<string, string> }).env, { DISPLAY: ":1" });
   // Unknown ids never produce an entry — a role can only wire what we ship.

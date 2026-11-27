@@ -75,7 +75,11 @@ const UI_FILTER_RE = /^[\p{L}\p{N} ._:()'&,\-]*$/u;
 const MAX_POLL_WAIT_MS = 60 * 1000;
 /** Apps the agent may open; the fixed mapping is the allowlist. */
 const OPEN_APPS = Object.freeze({
-  browser: Object.freeze(["chromium", "--new-window"]),
+  // --remote-debugging-port=9222 opens the CDP debug port so the Browser tab
+  // can mirror this Chromium (see lib/browser/cdp-endpoint.ts). Whichever
+  // Chromium starts first on the shared profile owns the port; a later
+  // launch attaches to the running instance and its flag is ignored.
+  browser: Object.freeze(["chromium", "--new-window", "--remote-debugging-port=9222"]),
   terminal: Object.freeze(["xfce4-terminal"]),
   files: Object.freeze(["thunar"]),
   libreoffice: Object.freeze(["lowriter"]),

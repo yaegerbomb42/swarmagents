@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { PLAYWRIGHT_LAUNCHER_SOURCE, PLAYWRIGHT_POLICY_SOURCE, PLAYWRIGHT_PROXY_SOURCE, PLAYWRIGHT_PROXY_VERSION } from "./playwright-policy";
+import { PLAYWRIGHT_LAUNCHER_SOURCE, PLAYWRIGHT_MCP_CONFIG_SOURCE, PLAYWRIGHT_POLICY_SOURCE, PLAYWRIGHT_PROXY_SOURCE, PLAYWRIGHT_PROXY_VERSION } from "./playwright-policy";
 
 type RouteHandler = (route: { abort: (reason: string) => Promise<void>; continue: () => Promise<void> }, request: { url: () => string }) => Promise<void>;
 
@@ -593,4 +593,13 @@ test("Playwright launcher replaces a stale-version proxy and logs its stderr", a
   assert.ok(mcp.args.includes("http://127.0.0.1:18793"));
   assert.ok(mcp.args.includes("--proxy-bypass"));
   assert.deepEqual(exits, [], "the launcher must not exit while replacing the proxy");
+});
+
+test("Playwright MCP config opens the CDP debug port for the Browser tab mirror", () => {
+  const config = JSON.parse(PLAYWRIGHT_MCP_CONFIG_SOURCE) as {
+    browser?: { launchOptions?: { args?: string[] } };
+  };
+  // The debug port rides in a config file because the playwright-mcp CLI
+  // rejects unknown flags (verified against @playwright/mcp@0.0.85).
+  assert.deepEqual(config.browser?.launchOptions?.args, ["--remote-debugging-port=9222"]);
 });

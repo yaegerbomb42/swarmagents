@@ -94,6 +94,9 @@ test("runBrowserGate blocks relative script path escapes and bridges BrowserCont
       return null;
     },
     async close() {},
+    getMode() {
+      return "host" as const;
+    },
   };
 
   const backend = createBrowserControlBackend(fakeControl, "run-1");

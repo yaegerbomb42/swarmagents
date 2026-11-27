@@ -234,6 +234,8 @@ export class BrowserManager implements BrowserControl {
   private readonly env: Readonly<Record<string, string | undefined>>;
   /** Live host-launched sessions; the host browser closes when this hits 0. */
   private hostSessionCount = 0;
+  /** Host sessions currently in createHostSession() before hostSessionCount increments. */
+  private pendingHostCreations = 0;
 
   constructor(
     options: {
@@ -501,51 +503,56 @@ export class BrowserManager implements BrowserControl {
   }
 
   protected async createHostSession(runId: string): Promise<RunSession> {
-    const browser = await this.browser();
-    const context = await browser.newContext({ viewport: DEFAULT_VIEWPORT });
-    const page = await context.newPage();
-    const session = {
-      context,
-      page,
-      frame: null,
-      frameSeq: 0,
-      pendingChange: true,
-      lastUserActivityAt: Date.now(),
-      lastCaptureAt: 0,
-      captureInFlight: null as Promise<BrowserFrame | null> | null,
-      diagnostics: [] as BrowserDiagnosticEntry[],
-      ownsContext: true,
-      pageGeneration: 0,
-      closed: false,
-    } as RunSession;
+    this.pendingHostCreations += 1;
+    try {
+      const browser = await this.browser();
+      const context = await browser.newContext({ viewport: DEFAULT_VIEWPORT });
+      const page = await context.newPage();
+      const session = {
+        context,
+        page,
+        frame: null,
+        frameSeq: 0,
+        pendingChange: true,
+        lastUserActivityAt: Date.now(),
+        lastCaptureAt: 0,
+        captureInFlight: null as Promise<BrowserFrame | null> | null,
+        diagnostics: [] as BrowserDiagnosticEntry[],
+        ownsContext: true,
+        pageGeneration: 0,
+        closed: false,
+      } as RunSession;
 
-    // Any browser activity marks the run as needing a fresh frame.
-    page.on("load", () => {
-      session.pendingChange = true;
-      session.lastUserActivityAt = Date.now();
-    });
-    page.on("requestfinished", () => {
-      session.pendingChange = true;
-      session.lastUserActivityAt = Date.now();
-    });
+      // Any browser activity marks the run as needing a fresh frame.
+      page.on("load", () => {
+        session.pendingChange = true;
+        session.lastUserActivityAt = Date.now();
+      });
+      page.on("requestfinished", () => {
+        session.pendingChange = true;
+        session.lastUserActivityAt = Date.now();
+      });
 
-    this.attachDiagnostics(page, session);
-    this.attachRequestGuards(page);
+      this.attachDiagnostics(page, session);
+      this.attachRequestGuards(page);
 
-    // Auto-close when the run ends: no browser left running for a dead run.
-    session.unsubscribe = this.bus.subscribe(runId, 0, (event) => {
-      if (event.type === "run.finished" || event.type === "run.error" || event.type === "run.cancelled") {
-        void this.close(runId);
-      }
-    });
+      // Auto-close when the run ends: no browser left running for a dead run.
+      session.unsubscribe = this.bus.subscribe(runId, 0, (event) => {
+        if (event.type === "run.finished" || event.type === "run.error" || event.type === "run.cancelled") {
+          void this.close(runId);
+        }
+      });
 
-    session.heartbeat = setInterval(() => {
-      void this.captureFrame(runId, session, false);
-    }, FRAME_HEARTBEAT_MS);
-    session.heartbeat.unref?.();
+      session.heartbeat = setInterval(() => {
+        void this.captureFrame(runId, session, false);
+      }, FRAME_HEARTBEAT_MS);
+      session.heartbeat.unref?.();
 
-    this.hostSessionCount += 1;
-    return session;
+      this.hostSessionCount += 1;
+      return session;
+    } finally {
+      this.pendingHostCreations -= 1;
+    }
   }
 
   /**
@@ -653,7 +660,9 @@ export class BrowserManager implements BrowserControl {
     } catch {
       // Session creation itself failed; nothing to tear down.
     }
-    if (this.hostSessionCount === 0) {
+    // Only close the shared host browser when no host sessions are active OR
+    // currently being created (prevents closing out from under a concurrent ensureSession).
+    if (this.hostSessionCount === 0 && this.pendingHostCreations === 0) {
       const hostBrowser = this.browsersByEndpoint.get("host");
       if (hostBrowser) {
         this.browsersByEndpoint.delete("host");

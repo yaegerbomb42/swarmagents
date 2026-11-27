@@ -232,9 +232,10 @@ export default function App() {
     (runId: string) => {
       setSeenScheduleRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId].slice(-200)));
       session.selectThread(runId);
-      setView("chat");
+      // No views anymore: the conversation is a slide-over, so open it.
+      setChatOpen(true);
     },
-    [session, setSeenScheduleRunIds, setView],
+    [session, setSeenScheduleRunIds, setChatOpen],
   );
   const [settings, setSettings] = useState<{ open: boolean; tab: SettingsTab }>({ open: false, tab: "providers" });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);

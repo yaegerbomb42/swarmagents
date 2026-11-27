@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import React from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Play, Plug, Plus, Sparkles, Trash2, X, Zap,
@@ -54,8 +53,6 @@ export function RunModeBadge({ runMode }: { runMode?: { mode?: string; label?: s
     </span>
   );
 }
-
-export const RunModePill = RunModeBadge;
 
 /* Active-tab / toggle accent per selection — full class literals so Tailwind picks them up. */
 const ACCENTS: Record<Accent, { tab: string; toggleOn: string; swatchRing: string; swatch: string }> = {
@@ -2076,15 +2073,7 @@ function ServerEndpoints({
         {result && (
           <div className="space-y-1">
             <div data-testid="endpoint-result" className={`text-[10px] ${result.ok ? 'text-emerald-300/80' : 'text-red-300/80'}`}>{result.text}</div>
-            {result.ok && runModeLabel(result.runMode) && (
-              <span
-                title={result.runMode?.reason}
-                data-testid="provider-runmode"
-                className="inline-flex rounded-full border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] font-medium text-white/80"
-              >
-                {runModeLabel(result.runMode)}
-              </span>
-            )}
+            {result.ok && <RunModeBadge runMode={result.runMode} />}
           </div>
         )}
       </div>

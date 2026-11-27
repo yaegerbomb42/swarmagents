@@ -44,10 +44,3 @@ export function runModeLabel(input: RunModeInput): string | null {
       return null;
   }
 }
-
-export const runModeBadge = runModeLabel;
-export const labelForRunMode = runModeLabel;
-export const badgeForRunMode = runModeLabel;
-export const runModeToLabel = runModeLabel;
-
-export default runModeLabel;

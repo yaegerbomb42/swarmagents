@@ -303,3 +303,36 @@ test("installer never passes the node token on the worker command line", async (
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("windows installer enforces parity: validation, -- prompt guard, heartbeat runspace, 401 exit, stream-json/resume, timeout, truncation, and NTFS ACLs", async () => {
+  const res = await GET(new NextRequest("http://localhost/api/computers/node/install?os=windows"));
+  assert.equal(res.status, 200);
+  const ps = await res.text();
+
+  // Parameter validation before pairing request.
+  assert.match(ps, /\$Code -notmatch '\^\[A-Za-z0-9-\]\+\$'/);
+  assert.match(ps, /\$Mode -cnotin @\("host", "docker", "sandbox"\)/);
+  assert.match(ps, /\$Server -notmatch '\^https\?:\/\/\[A-Za-z0-9\.-\]\+\(:\[0-9\]\+\)\?\$'/);
+
+  // NTFS ACL restriction on computer.json.
+  assert.match(ps, /SetAccessRuleProtection\(\$true, \$false\)/);
+  assert.match(ps, /Set-Acl -Path \$configPath/);
+  assert.match(ps, /icacls \$configPath \/inheritance:r/);
+
+  // Background heartbeat runspace while claude executes.
+  assert.match(ps, /\[runspacefactory\]::CreateRunspace\(\)/);
+  assert.match(ps, /action = "heartbeat"/);
+
+  // HTTP 401 exits cleanly instead of looping forever.
+  assert.match(ps, /Test-Unauthorized/);
+  assert.match(ps, /\[int\]\$resp\.StatusCode -eq 401/);
+
+  // stream-json + --resume + `--` before $job.prompt + 3600s timeout + body truncation.
+  assert.match(ps, /"--output-format", "stream-json"/);
+  assert.match(ps, /"--resume", \[string\]\$job\.sessionId/);
+  assert.match(ps, /"--", \[string\]\$job\.prompt/);
+  assert.match(ps, /\$RUN_TIMEOUT_MS = 3600000/);
+  assert.match(ps, /WaitForExit\(\$RUN_TIMEOUT_MS\)/);
+  assert.match(ps, /\$MAX_BODY_CHARS = 180000/);
+  assert.match(ps, /Limit-Field \$text \$MAX_BODY_CHARS/);
+});

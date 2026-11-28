@@ -555,9 +555,17 @@ while True:
 PY
 `;
 
-const POWERSHELL_SCRIPT = `param([string]$Code, [string]$Server = "https://swarmagents.codes", [string]$Mode = "host")
+const POWERSHELL_SCRIPT = String.raw`param([string]$Code, [string]$Server = "https://swarmagents.codes", [string]$Mode = "host")
 $ErrorActionPreference = "Stop"
 if (-not $Code) { Write-Error "Missing -Code. Create a pairing code in Settings > Computers."; exit 1 }
+if ($Code -notmatch '^[A-Za-z0-9-]+$') { Write-Error "Invalid pairing code."; exit 1 }
+if ($Mode -cnotin @("host", "docker", "sandbox")) { Write-Error "Invalid -Mode. Use host, docker or sandbox."; exit 2 }
+$Server = $Server.TrimEnd("/")
+if ($Server -notmatch '^https?://[A-Za-z0-9.-]+(:[0-9]+)?$') {
+  Write-Error "Invalid -Server. Use an http(s) origin like https://swarmagents.codes."
+  exit 2
+}
+
 $machine = @{ os = "windows"; arch = $env:PROCESSOR_ARCHITECTURE; mode = $Mode }
 $pairBody = @{ code = $Code; machine = $machine } | ConvertTo-Json -Depth 4
 try {
@@ -566,38 +574,136 @@ try {
   Write-Error "Pairing failed. The code may be expired or already used."
   exit 1
 }
+
 $dir = Join-Path $HOME ".swarmagents"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$configPath = Join-Path $dir "computer.json"
 $config = @{ computerId = $pair.computer.id; nodeToken = $pair.nodeToken; server = $Server } | ConvertTo-Json
-Set-Content -Path (Join-Path $dir "computer.json") -Value $config -Encoding utf8
+Set-Content -Path $configPath -Value $config -Encoding utf8
+try {
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $acl = Get-Acl -Path $configPath
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, "FullControl", "Allow")
+  $acl.SetAccessRule($rule)
+  Set-Acl -Path $configPath -AclObject $acl
+} catch {
+  try { & icacls $configPath /inheritance:r /grant:r ("$env:USERNAME" + ":(F)") | Out-Null } catch {}
+}
+
 Write-Host "Paired as $($pair.computer.id). Keeping this computer online (Ctrl-C to stop)."
 $headers = @{ Authorization = "Bearer $($pair.nodeToken)"; "x-computer-id" = $pair.computer.id }
 $node = "$Server/api/computers/node"
+$MAX_BODY_CHARS = 180000
+$RUN_TIMEOUT_MS = 3600000
+
+function Test-Unauthorized($err) {
+  try {
+    $resp = $err.Exception.Response
+    if ($null -ne $resp -and [int]$resp.StatusCode -eq 401) { return $true }
+  } catch {}
+  return $false
+}
+
+function Limit-Field([string]$value, [int]$maxChars) {
+  if ([string]::IsNullOrEmpty($value)) { return "" }
+  if ($value.Length -le $maxChars) { return $value }
+  return $value.Substring(0, $maxChars)
+}
+
 while ($true) {
   try {
     Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body (@{ action = "heartbeat"; machine = $machine } | ConvertTo-Json -Depth 4) | Out-Null
-  } catch {}
+  } catch {
+    if (Test-Unauthorized $_) { Write-Host "Token revoked (401). Exiting."; exit 0 }
+  }
+
   $claim = $null
-  try { $claim = Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body (@{ action = "claim" } | ConvertTo-Json) } catch {}
+  try {
+    $claim = Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body (@{ action = "claim" } | ConvertTo-Json)
+  } catch {
+    if (Test-Unauthorized $_) { Write-Host "Token revoked (401). Exiting."; exit 0 }
+  }
+
   if ($claim -and $claim.job) {
     $job = $claim.job
     $status = "finished"
     $code = 0
     $text = ""
     $errorText = ""
+
+    $hbStop = New-Object System.Threading.ManualResetEventSlim($false)
+    $hbRunspace = [runspacefactory]::CreateRunspace()
+    $hbRunspace.Open()
+    $hbPs = [powershell]::Create()
+    $hbPs.Runspace = $hbRunspace
+    $null = $hbPs.AddScript({
+      param($Uri, $Headers, $Machine, $StopEvent)
+      while (-not $StopEvent.Wait(15000)) {
+        try {
+          Invoke-RestMethod -Method Post -Uri $Uri -Headers $Headers -ContentType "application/json" -Body (@{ action = "heartbeat"; machine = $Machine } | ConvertTo-Json -Depth 4) | Out-Null
+        } catch {}
+      }
+    }).AddArgument($node).AddArgument($headers).AddArgument($machine).AddArgument($hbStop)
+    $hbAsync = $hbPs.BeginInvoke()
+
     try {
-      $text = (& claude -p $job.prompt 2>&1 | Out-String)
-      $code = $LASTEXITCODE
-      if ($code -ne 0) { $status = "error" }
+      $claudeCmd = Get-Command claude -ErrorAction Stop
+      $claudeArgs = @("-p", "--output-format", "stream-json")
+      if ($job.sessionId) { $claudeArgs += @("--resume", [string]$job.sessionId) }
+      $claudeArgs += @("--", [string]$job.prompt)
+
+      $psi = New-Object System.Diagnostics.ProcessStartInfo
+      $psi.FileName = $claudeCmd.Source
+      $psi.RedirectStandardOutput = $true
+      $psi.RedirectStandardError = $true
+      $psi.UseShellExecute = $false
+      $psi.CreateNoWindow = $true
+      $escaped = $claudeArgs | ForEach-Object { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }
+      $psi.Arguments = ($escaped -join " ")
+
+      $proc = [System.Diagnostics.Process]::Start($psi)
+      $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+      $stderrTask = $proc.StandardError.ReadToEndAsync()
+      if (-not $proc.WaitForExit($RUN_TIMEOUT_MS)) {
+        try { & taskkill /T /F /PID $proc.Id 2>$null | Out-Null } catch {}
+        try { $proc.Kill() } catch {}
+        $code = 124
+        $status = "error"
+        $errorText = "claude timed out after 3600s."
+      } else {
+        $proc.WaitForExit()
+        $code = $proc.ExitCode
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $text = $stdout
+        if ($code -ne 0) {
+          $status = "error"
+          $errorText = $stderr
+        }
+      }
     } catch {
       $code = 127
       $status = "error"
       $errorText = "claude is not installed on this computer."
+    } finally {
+      $hbStop.Set()
+      try { $hbPs.EndInvoke($hbAsync) } catch {}
+      $hbPs.Dispose()
+      $hbRunspace.Close()
+      $hbRunspace.Dispose()
+      $hbStop.Dispose()
     }
+
+    $text = Limit-Field $text $MAX_BODY_CHARS
+    $errorText = Limit-Field $errorText $MAX_BODY_CHARS
     try {
       $body = @{ action = "complete"; runId = $job.runId; result = @{ status = $status; exitCode = $code; text = $text; error = $errorText } } | ConvertTo-Json -Depth 5
       Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $body | Out-Null
-    } catch {}
+    } catch {
+      if (Test-Unauthorized $_) { Write-Host "Token revoked (401). Exiting."; exit 0 }
+    }
   }
   Start-Sleep -Seconds 3
 }
